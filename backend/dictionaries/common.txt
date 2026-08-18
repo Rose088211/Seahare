@@ -1,0 +1,14 @@
+admin
+api
+api/v1
+assets
+backup
+config
+dashboard
+docs
+health
+login
+robots.txt
+server-status
+static
+uploads

@@ -1,0 +1,1 @@
+"""Seahare local scanning backend."""

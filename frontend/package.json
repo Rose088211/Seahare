@@ -1,0 +1,74 @@
+{
+  "name": "seahare",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Modern local Web directory scanner for Windows",
+  "author": "Seahare",
+  "type": "module",
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "concurrently -k -s first \"vite\" \"electron .\"",
+    "electron:dev": "electron .",
+    "build": "tsc -b && vite build",
+    "package": "npm run build && electron-builder --win nsis portable",
+    "package:dir": "npm run build && electron-builder --dir",
+    "package:dir:fallback": "npm run build && powershell -ExecutionPolicy Bypass -File scripts/package-dir.ps1",
+    "lint": "oxlint",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
+    "dompurify": "^3.4.13",
+    "lucide-react": "^1.31.0",
+    "marked": "^18.0.9",
+    "node-pty": "^1.1.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.4",
+    "concurrently": "^10.0.4",
+    "electron": "^43.4.0",
+    "electron-builder": "^26.15.3",
+    "oxlint": "^1.75.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.2.0"
+  },
+  "build": {
+    "appId": "com.seahare.app",
+    "productName": "Seahare",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "dist/**/*",
+      "electron/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/seahare-backend.exe",
+        "to": "backend/seahare-backend.exe"
+      },
+      {
+        "from": "node_modules/node-pty",
+        "to": "app/node_modules/node-pty",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  }
+}
