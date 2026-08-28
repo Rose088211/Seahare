@@ -353,7 +353,7 @@ function BrowserTab() {
 const FloatingWorkspace = forwardRef<FloatingWorkspaceHandle, FloatingWorkspaceProps>(function FloatingWorkspace({ open, onClose }, ref) {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
-  const [mode, setMode] = useState<PanelMode>('normal');
+  const [mode, setMode] = useState<PanelMode>('min');
   const [pos, setPos] = useState({ x: 0, y: 0 });
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuRect, setMenuRect] = useState<{ left: number; top: number } | null>(null);

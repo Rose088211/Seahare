@@ -173,7 +173,7 @@ export default function App() {
   const [dictionaryError, setDictionaryError] = useState<string | null>(null);
   const [dictionarySaving, setDictionarySaving] = useState(false);
   const [dictionaryDrag, setDictionaryDrag] = useState(false);
-  const [workspaceOpen, setWorkspaceOpen] = useState(false);
+  const [workspaceOpen, setWorkspaceOpen] = useState(true);
   const workspaceRef = useRef<FloatingWorkspaceHandle>(null);
 
   const [theme, setTheme] = useState<'dark' | 'light'>(() => (localStorage.getItem('seahare-theme') as 'dark' | 'light') || 'dark');
