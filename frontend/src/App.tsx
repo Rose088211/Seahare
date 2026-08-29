@@ -149,8 +149,8 @@ export default function App() {
   const [newTarget, setNewTarget] = useState('');
   const [newPreset, setNewPreset] = useState('balanced');
   const [newDictionary, setNewDictionary] = useState('common.txt');
-  const [newThreads, setNewThreads] = useState(24);
-  const [newTimeout, setNewTimeout] = useState(8);
+  const [newThreads, setNewThreads] = useState(8);
+  const [newTimeout, setNewTimeout] = useState(10);
   const [scanMode, setScanMode] = useState<'dictionary' | 'enum'>('dictionary');
   const [enumCharset, setEnumCharset] = useState(ENUM_DEFAULT_CHARSET);
   // Length fields use string state so the user can type freely (clearing the
@@ -957,7 +957,11 @@ export default function App() {
                         <tbody>
                           {filteredResults.map((result) => (
                             <tr key={result.id}>
-                              <td className="cell-path" title={result.path}>{result.path}</td>
+                              <td className="cell-path" title={result.path}>
+                                <a className="cell-path-link" href={result.url} target="_blank" rel="noopener noreferrer" title="打开接口响应（JSON）" aria-label={`打开接口响应 ${result.path}`}>
+                                  <span>{result.path}</span><ExternalLink size={10} />
+                                </a>
+                              </td>
                               <td><span className={`status-code-badge ${statusCodeClass(result.status)}`}>{result.status}</span></td>
                               <td><span className={`severity-badge severity-${result.severity || 'low'}`}>{severityText[result.severity || 'low']}</span></td>
                               <td className="cell-category">{categoryText[result.category] || result.category || '可访问'}</td>
@@ -965,7 +969,7 @@ export default function App() {
                               <td className="cell-size">{result.length.toLocaleString()} B</td>
                               <td className="cell-content-type">{result.content_type || '-'}</td>
                               <td className="cell-time">{result.response_time} ms</td>
-                              <td className="cell-url"><a href={result.url} target="_blank" rel="noopener noreferrer">{formatTime(result.discovered_at)}<ExternalLink size={10} /></a></td>
+                              <td className="cell-url">{formatTime(result.discovered_at)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -1099,7 +1103,7 @@ export default function App() {
 
                 {scanMode === 'dictionary' ? (
                   <div className="form-group">
-                    <label className="form-label" htmlFor="scan-dictionary"><BookOpen size={11} />扫描字典</label>
+                    <label className="form-label" htmlFor="scan-dictionary"><BookOpen size={11} />扫描字典 <span className="form-label-hint">建议选择自定义字典</span></label>
                     <div className="input-with-action">
                       <select id="scan-dictionary" className="form-input" value={newDictionary} onChange={(event) => { setNewDictionary(event.target.value); setNewPreset('custom'); }} disabled={submitting}>
                         {dictionaryItems.map((item) => <option key={item.name} value={item.name}>{item.name} ({item.entries})</option>)}

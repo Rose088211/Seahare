@@ -1,0 +1,5 @@
+index/index
+home/index
+goods/list
+catalog/index
+auth/login

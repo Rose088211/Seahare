@@ -666,6 +666,25 @@ a:focus-visible {
   text-overflow: ellipsis;
 }
 
+.cell-path-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  max-width: 100%;
+  overflow: hidden;
+  color: inherit;
+  text-decoration: none;
+}
+
+.cell-path-link span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-path-link:hover {
+  color: var(--color-primary);
+}
+
 .cell-url {
   color: var(--text-muted);
   max-width: 300px;
@@ -934,6 +953,13 @@ a:focus-visible {
   float: right;
   color: var(--text-main);
   font-family: var(--font-mono);
+}
+
+.form-label-hint {
+  margin-left: 7px;
+  color: var(--color-primary);
+  font-size: 10px;
+  font-weight: 500;
 }
 
 .preset-control {
