@@ -21,7 +21,66 @@ class TargetHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
 
+class EvidenceTargetHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+    def do_GET(self):
+        if self.path == "/":
+            body = b"<html><body>app shell</body></html>"
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.send_header("Content-Length", str(len(body)))
+        elif self.path == "/same":
+            body = b"<html><body>app shell</body></html>"
+            self.send_response(200); self.send_header("Content-Type", "text/html"); self.send_header("Content-Length", str(len(body)))
+        elif self.path == "/login":
+            body = b'{"errno":502,"errmsg":"internal error"}'
+            self.send_response(200); self.send_header("Content-Type", "application/json"); self.send_header("Content-Length", str(len(body)))
+        else:
+            body = b"missing"; self.send_response(404); self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+
+
+class AutoMethodTargetHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+
+    def _record(self, method: str, status: int = 200):
+        self.server.request_methods.append((method, self.path))
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length else b""
+        if body:
+            self.server.request_bodies.append((method, body, self.headers.get("Content-Type")))
+        payload = b'{"ok":true}' if status == 200 else b"missing"
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        if method != "HEAD":
+            self.wfile.write(payload)
+
+    def do_GET(self):
+        self._record("GET", 404)
+
+    def do_POST(self):
+        self._record("POST")
+
+    do_PUT = lambda self: self._record("PUT")
+    do_PATCH = lambda self: self._record("PATCH")
+    do_DELETE = lambda self: self._record("DELETE")
+    do_HEAD = lambda self: self._record("HEAD")
+    do_OPTIONS = lambda self: self._record("OPTIONS")
+
+
 class BackendTests(unittest.TestCase):
+    def test_development_dictionary_directory_is_separate(self):
+        with tempfile.TemporaryDirectory() as folder:
+            data_dir = Path(folder)
+            self.assertEqual(
+                server_module.custom_dictionary_path(data_dir, data_dir / "dictionaries"),
+                data_dir / "custom-dictionaries",
+            )
+            self.assertEqual(
+                server_module.custom_dictionary_path(data_dir, data_dir / "builtin"),
+                data_dir / "dictionaries",
+            )
+
     def test_scan_lifecycle_and_persistence(self):
         server = ThreadingHTTPServer(("127.0.0.1", 0), TargetHandler)
         server.request_paths = []
@@ -106,6 +165,7 @@ class BackendTests(unittest.TestCase):
                         time.sleep(.05)
                         scan = self._json(f"{base}/api/scans/{scan['id']}")
                     self.assertEqual(scan["status"], "completed")
+                    self.assertEqual(scan["request_headers"], {})
 
                     results = self._json(f"{base}/api/scans/{scan['id']}/results?status=all")["results"]
                     self.assertEqual({row["path"] for row in results}, {"/admin", "/docs", "/robots.txt"})
@@ -136,7 +196,7 @@ class BackendTests(unittest.TestCase):
                     with urlopen(f"{base}/api/scans/{scan['id']}/export.csv") as response:
                         csv_body = response.read().decode()
                         self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
-                    self.assertIn("path,url,status", csv_body)
+                    self.assertIn("path,url,request_method,status", csv_body)
                     self.assertIn("severity,category", csv_body)
                     self.assertIn("redirect_location", csv_body)
                     self.assertIn("/admin", csv_body)
@@ -222,6 +282,116 @@ class BackendTests(unittest.TestCase):
                     store.close()
         finally:
             server.shutdown(); server.server_close()
+
+    def test_response_evidence_and_request_profile(self):
+        target = ThreadingHTTPServer(("127.0.0.1", 0), EvidenceTargetHandler)
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        old_custom_dir = server_module.CUSTOM_DICTIONARY_DIR
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                server_module.CUSTOM_DICTIONARY_DIR = Path(folder) / "dictionaries"
+                server_module.CUSTOM_DICTIONARY_DIR.mkdir()
+                (server_module.CUSTOM_DICTIONARY_DIR / "evidence.txt").write_text("login\nsame\n", encoding="utf-8")
+                store = Store(Path(folder) / "evidence.db")
+                try:
+                    manager = ScanManager(store)
+                    job = manager.create(
+                        f"http://127.0.0.1:{target.server_port}", "evidence.txt", 2, 2,
+                        target_type="api", request_method="GET", request_headers={"X-Test": "yes"},
+                    )
+                    deadline = time.time() + 5
+                    while job.status not in ("completed", "failed") and time.time() < deadline: time.sleep(.05)
+                    self.assertEqual(job.status, "completed")
+                    saved = store.scan(job.id)
+                    self.assertEqual(saved["target_type"], "api")
+                    self.assertEqual(saved["request_method"], "GET")
+                    self.assertEqual(server_module.json.loads(saved["request_headers"]), {"X-Test": "yes"})
+                    rows = {row["path"]: row for row in store.results(job.id)}
+                    self.assertEqual(rows["/login"]["business_code"], 502)
+                    self.assertEqual(rows["/login"]["category"], "business_error")
+                    self.assertEqual(rows["/login"]["business_message"], "internal error")
+                    self.assertFalse(rows["/login"]["spa_fallback"])
+                    self.assertTrue(rows["/same"]["spa_fallback"])
+                    self.assertEqual(rows["/same"]["category"], "spa_fallback")
+                    self.assertEqual(len(rows["/same"]["body_hash"]), 16)
+                finally:
+                    store.close()
+        finally:
+            server_module.CUSTOM_DICTIONARY_DIR = old_custom_dir
+            target.shutdown(); target.server_close()
+
+    def test_auto_request_method_tries_all_methods(self):
+        target = ThreadingHTTPServer(("127.0.0.1", 0), AutoMethodTargetHandler)
+        target.request_methods = []
+        target.request_bodies = []
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        old_custom_dir = server_module.CUSTOM_DICTIONARY_DIR
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                server_module.CUSTOM_DICTIONARY_DIR = Path(folder) / "dictionaries"
+                server_module.CUSTOM_DICTIONARY_DIR.mkdir()
+                (server_module.CUSTOM_DICTIONARY_DIR / "auto.txt").write_text("login\n", encoding="utf-8")
+                store = Store(Path(folder) / "auto.db")
+                try:
+                    manager = ScanManager(store)
+                    job = manager.create(
+                        f"http://127.0.0.1:{target.server_port}", "auto.txt", 1, 2,
+                        request_method="AUTO",
+                    )
+                    deadline = time.time() + 5
+                    while job.status not in ("completed", "failed") and time.time() < deadline: time.sleep(.05)
+                    self.assertEqual(job.status, "completed")
+                    self.assertEqual(store.scan(job.id)["request_method"], "AUTO")
+                    methods = [method for method, path in target.request_methods if path == "/login"]
+                    self.assertEqual(methods, ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
+                    self.assertEqual(job.requests, 7)
+                    self.assertEqual(job.found, 6)
+                    self.assertEqual(
+                        {row["request_method"] for row in store.results(job.id)},
+                        {"POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+                    )
+                    self.assertEqual(
+                        {(method, body, content_type) for method, body, content_type in target.request_bodies},
+                        {
+                            (method, b'{"value":"login"}', "application/json")
+                            for method in ("POST", "PUT", "PATCH", "DELETE")
+                        },
+                    )
+                finally:
+                    store.close()
+        finally:
+            server_module.CUSTOM_DICTIONARY_DIR = old_custom_dir
+            target.shutdown(); target.server_close()
+
+    def test_result_classification_survives_reopen(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "classification.db"
+            store = Store(path)
+            try:
+                self.assertTrue(store.add_result("scan", {
+                    "path": "/auth/login", "url": "http://target/auth/login", "status": 200,
+                    "length": 43, "content_type": "application/json", "response_time": 1.0,
+                    "business_code": 502, "business_message": "internal error",
+                    "response_preview": '{"errno":502}', "body_hash": "bizhash",
+                }))
+                self.assertTrue(store.add_result("scan", {
+                    "path": "/unknown", "url": "http://target/unknown", "status": 200,
+                    "length": 24, "content_type": "text/html", "response_time": 1.0,
+                    "response_preview": "<html>shell</html>", "body_hash": "spahash",
+                    "spa_fallback": True,
+                }))
+            finally:
+                store.close()
+
+            reopened = Store(path)
+            try:
+                rows = {row["path"]: row for row in reopened.results("scan")}
+                self.assertEqual(rows["/auth/login"]["category"], "business_error")
+                self.assertEqual(rows["/auth/login"]["business_code"], 502)
+                self.assertEqual(rows["/unknown"]["category"], "spa_fallback")
+                self.assertTrue(rows["/unknown"]["spa_fallback"])
+            finally:
+                reopened.close()
 
     @staticmethod
     def _json(url):

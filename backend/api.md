@@ -18,6 +18,7 @@ strategies. A dictionary item includes `name`, `entries`, `size`, and `builtin`.
 - `GET /api/scans`
 - `POST /api/scans`
 - `GET /api/scans/{id}`
+- `DELETE /api/scans/{id}` (completed or cancelled scans; deletes its results)
 - `POST /api/scans/{id}/pause`
 - `POST /api/scans/{id}/resume`
 - `POST /api/scans/{id}/cancel`
@@ -36,9 +37,26 @@ Dictionary mode:
   "preset": "balanced",
   "dictionary": "common.txt",
   "threads": 24,
-  "timeout": 8
+  "timeout": 8,
+  "target_type": "api",
+  "request_method": "GET",
+  "request_headers": {},
+  "request_body": ""
 }
 ```
+
+`target_type` is one of `web`, `api`, or `h5` and records the intended target
+kind for result interpretation. `request_method` accepts `AUTO`, `GET`, `POST`,
+`PUT`, `PATCH`, `DELETE`, `HEAD`, or `OPTIONS`. `AUTO` expands each dictionary
+or enumeration value into all seven explicit methods. For `POST`, `PUT`,
+`PATCH`, and `DELETE`, an empty body is generated as JSON
+`{"value":"current-value"}`; a supplied body template is used instead, with
+`{fuzz}` replaced by the current dictionary or enumeration value.
+`request_headers` is an object of header names to values, and `request_body` is
+an optional UTF-8 body. A body automatically receives
+`Content-Type: application/json` when no content type header is supplied.
+Results include the actual `request_method` and are unique by scan, path, and
+method.
 
 Custom enumeration mode generates path combinations from a charset instead of
 reading a dictionary file. The target must contain the `{fuzz}` placeholder,
@@ -97,6 +115,10 @@ Create response and scan detail share this shape:
   "threads": 24,
   "timeout": 8.0,
   "preset": "balanced",
+  "target_type": "api",
+  "request_method": "POST",
+  "request_headers": { "X-Test": "local" },
+  "request_body": "{\"username\":\"demo\"}",
   "status": "running",
   "progress": 0.42,
   "requests": 120,
@@ -142,9 +164,15 @@ The endpoint is cursor based. Append `results`, then request again using
 }
 ```
 
-Each result keeps the v1 fields and adds `severity`, `category`, and
-`redirect_location`. Redirect responses are recorded without following the
-`Location` target, keeping probes inside the configured scan origin.
+Each result keeps the v1 fields and adds `request_method`, `severity`, `category`,
+`redirect_location`, `business_code`, `business_message`, `response_preview`,
+`body_hash`, and `spa_fallback`. `business_code` and `business_message` are
+read from common JSON fields such as `errno`/`errmsg` or `code`/`message`.
+`spa_fallback` is true when an HTML response has the same bounded body
+fingerprint as the scan target baseline, which commonly indicates a single-page
+application fallback rather than a real directory. Redirect responses are
+recorded without following the `Location` target, keeping probes inside the
+configured scan origin.
 
 ## Live events
 
