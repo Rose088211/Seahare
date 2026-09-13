@@ -64,6 +64,7 @@ const themeOptions: Array<{ value: Theme; label: string }> = [
   { value: 'mist', label: '淡色玻璃' },
 ];
 type RequestMethod = 'AUTO' | 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 'HEAD' | 'OPTIONS';
+type AuthType = 'none' | 'basic' | 'digest' | 'bearer';
 
 // Keep in sync with backend TARGET_TYPES / REQUEST_METHODS (server.py).
 const TARGET_TYPES: TargetType[] = ['web', 'api', 'h5'];
@@ -98,6 +99,12 @@ interface Scan {
   request_method: RequestMethod;
   request_headers: Record<string, string>;
   request_body: string;
+  request_options?: {
+    max_retries: number;
+    proxies: string[];
+    auth: { type: AuthType };
+    response_filters: Record<string, unknown>;
+  };
   mode: string;
   charset: string;
   min_len: number;
@@ -289,10 +296,139 @@ const categoryText: Record<string, string> = {
   accessible: '可访问',
   business_error: '业务错误',
   spa_fallback: 'SPA 回退',
+  wildcard: '通配响应',
 };
 
 const rangeFill = (value: number, min: number, max: number) =>
   `${Math.max(0, Math.min(100, ((value - min) / (max - min)) * 100))}%`;
+
+const VIRTUAL_RESULT_ROW_HEIGHT = 33;
+const VIRTUAL_RESULT_EVIDENCE_HEIGHT = 195;
+const VIRTUAL_RESULT_OVERSCAN = 8;
+
+type VirtualRowMeasure = (id: number, kind: 'base' | 'evidence', height: number) => void;
+
+interface VirtualizedResultsTableProps {
+  results: ScanResult[];
+  expandedResultIds: ReadonlySet<number>;
+  hasResultEvidence: (result: ScanResult) => boolean;
+  renderRow: (result: ScanResult, index: number, measureRow: VirtualRowMeasure) => React.ReactNode;
+}
+
+function VirtualizedResultsTable({
+  results,
+  expandedResultIds,
+  hasResultEvidence,
+  renderRow,
+}: VirtualizedResultsTableProps) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(0);
+  const [rowHeights, setRowHeights] = useState<Record<number, { base?: number; evidence?: number }>>({});
+
+  const measureRow: VirtualRowMeasure = useCallback((id, kind, height) => {
+    if (!Number.isFinite(height) || height <= 0) return;
+    setRowHeights((current) => {
+      const previous = current[id]?.[kind];
+      if (previous !== undefined && Math.abs(previous - height) < 0.5) return current;
+      return {
+        ...current,
+        [id]: { ...current[id], [kind]: height },
+      };
+    });
+  }, []);
+
+  const rowOffsets = useMemo(() => {
+    const offsets = [0];
+    for (const result of results) {
+      const expanded = expandedResultIds.has(result.id) && hasResultEvidence(result);
+      const measured = rowHeights[result.id];
+      offsets.push(offsets[offsets.length - 1] + (measured?.base ?? VIRTUAL_RESULT_ROW_HEIGHT)
+        + (expanded ? measured?.evidence ?? VIRTUAL_RESULT_EVIDENCE_HEIGHT : 0));
+    }
+    return offsets;
+  }, [expandedResultIds, hasResultEvidence, results, rowHeights]);
+
+  useEffect(() => {
+    const node = scrollRef.current;
+    if (!node) return undefined;
+    const updateViewport = () => setViewportHeight(node.clientHeight);
+    updateViewport();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(updateViewport);
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+
+  const visibleRange = useMemo(() => {
+    const viewport = viewportHeight || 600;
+    const maxScrollTop = Math.max(0, rowOffsets[rowOffsets.length - 1] - viewport);
+    const boundedScrollTop = Math.min(scrollTop, maxScrollTop);
+    let low = 0;
+    let high = results.length;
+    while (low < high) {
+      const middle = Math.floor((low + high) / 2);
+      if (rowOffsets[middle + 1] <= boundedScrollTop) low = middle + 1;
+      else high = middle;
+    }
+    const start = Math.max(0, low - VIRTUAL_RESULT_OVERSCAN);
+    const endLimit = boundedScrollTop + viewport;
+    let end = low;
+    while (end < results.length && rowOffsets[end] < endLimit) end += 1;
+    return {
+      start,
+      end: Math.min(results.length, end + VIRTUAL_RESULT_OVERSCAN),
+      totalHeight: rowOffsets[rowOffsets.length - 1] || VIRTUAL_RESULT_ROW_HEIGHT,
+    };
+  }, [results.length, rowOffsets, scrollTop, viewportHeight]);
+
+  const handleScroll = (event: React.UIEvent<HTMLDivElement>) => {
+    setScrollTop(event.currentTarget.scrollTop);
+  };
+
+  return (
+    <div
+      ref={scrollRef}
+      className="virtual-table-scroll"
+      onScroll={handleScroll}
+      role="table"
+      aria-rowcount={results.length + 1}
+    >
+      <table className="results-table virtualized-results-table">
+        <colgroup>
+          <col style={{ width: '180px' }} />
+          <col style={{ width: '72px' }} />
+          <col style={{ width: '70px' }} />
+          <col style={{ width: '70px' }} />
+          <col style={{ width: '90px' }} />
+          <col style={{ width: '170px' }} />
+          <col style={{ width: '170px' }} />
+          <col style={{ width: '75px' }} />
+          <col style={{ width: '125px' }} />
+          <col style={{ width: '80px' }} />
+          <col style={{ width: '130px' }} />
+        </colgroup>
+        <thead>
+          <tr>
+            <th>路径</th><th>方法</th><th>状态</th><th>风险</th><th>分类</th>
+            <th>业务/证据</th><th>重定向位置</th><th>大小</th><th>内容类型</th><th>延迟</th><th>发现时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="virtual-spacer-row" aria-hidden="true">
+            <td colSpan={11} style={{ height: rowOffsets[visibleRange.start] }} />
+          </tr>
+          {results.slice(visibleRange.start, visibleRange.end).map((result, localIndex) => (
+            <React.Fragment key={result.id}>{renderRow(result, visibleRange.start + localIndex, measureRow)}</React.Fragment>
+          ))}
+          <tr className="virtual-spacer-row" aria-hidden="true">
+            <td colSpan={11} style={{ height: Math.max(0, visibleRange.totalHeight - rowOffsets[visibleRange.end]) }} />
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  );
+}
 
 const createDefaultScanName = (target: string, existingScans: Scan[]) => {
   let targetLabel = target.trim() || 'target';
@@ -334,6 +470,21 @@ export default function App() {
   const [newMethod, setNewMethod] = useState<RequestMethod>('AUTO');
   const [newHeaders, setNewHeaders] = useState<HeaderRow[]>([]);
   const [newBody, setNewBody] = useState('');
+  const [newMaxRetries, setNewMaxRetries] = useState(2);
+  const [newProxies, setNewProxies] = useState('');
+  const [newAuthType, setNewAuthType] = useState<AuthType>('none');
+  const [newAuthUsername, setNewAuthUsername] = useState('');
+  const [newAuthPassword, setNewAuthPassword] = useState('');
+  const [newAuthToken, setNewAuthToken] = useState('');
+  const [newIncludeStatuses, setNewIncludeStatuses] = useState('');
+  const [newExcludeStatuses, setNewExcludeStatuses] = useState('');
+  const [newMinResponseSize, setNewMinResponseSize] = useState(0);
+  const [newMaxResponseSize, setNewMaxResponseSize] = useState(0);
+  const [newMatchText, setNewMatchText] = useState('');
+  const [newExcludeText, setNewExcludeText] = useState('');
+  const [newMatchRegex, setNewMatchRegex] = useState('');
+  const [newExcludeRegex, setNewExcludeRegex] = useState('');
+  const [newExcludeWildcard, setNewExcludeWildcard] = useState(false);
   // Length fields use string state so the user can type freely (clearing the
   // field stays empty instead of snapping to 0, no auto leading zero). The
   // numeric values below are the clamped interpretations used for counting.
@@ -1355,6 +1506,26 @@ export default function App() {
         .map((row) => [row.key.trim(), row.value] as const)
         .filter(([name]) => name),
     );
+    const requestOptions = {
+      max_retries: newMaxRetries,
+      proxies: newProxies.split(/[\r\n,]+/).map((value) => value.trim()).filter(Boolean),
+      auth: newAuthType === 'basic' || newAuthType === 'digest'
+        ? { type: newAuthType, username: newAuthUsername, password: newAuthPassword }
+        : newAuthType === 'bearer'
+          ? { type: newAuthType, token: newAuthToken }
+          : { type: 'none' as const },
+      response_filters: {
+        include_status_codes: newIncludeStatuses,
+        exclude_status_codes: newExcludeStatuses,
+        min_size: newMinResponseSize,
+        max_size: newMaxResponseSize,
+        match_text: newMatchText,
+        exclude_text: newExcludeText,
+        match_regex: newMatchRegex,
+        exclude_regex: newExcludeRegex,
+        exclude_wildcard: newExcludeWildcard,
+      },
+    };
 
     let body: Record<string, unknown>;
     if (scanMode === 'enum') {
@@ -1370,6 +1541,7 @@ export default function App() {
         target, preset: newPreset, threads: newThreads, timeout: newTimeout,
         target_type: newTargetType, request_method: newMethod,
         request_headers: requestHeaders, request_body: newBody,
+        request_options: requestOptions,
         enum: { charset: [...new Set(charset)].join(''), min_len: enumMinLen, max_len: enumMaxLen },
       };
     } else {
@@ -1379,6 +1551,7 @@ export default function App() {
         threads: newThreads, timeout: newTimeout,
         target_type: newTargetType, request_method: newMethod,
         request_headers: requestHeaders, request_body: newBody,
+        request_options: requestOptions,
       };
     }
 
@@ -1401,6 +1574,21 @@ export default function App() {
       setNewTarget('');
       setNewHeaders([]);
       setNewBody('');
+      setNewMaxRetries(2);
+      setNewProxies('');
+      setNewAuthType('none');
+      setNewAuthUsername('');
+      setNewAuthPassword('');
+      setNewAuthToken('');
+      setNewIncludeStatuses('');
+      setNewExcludeStatuses('');
+      setNewMinResponseSize(0);
+      setNewMaxResponseSize(0);
+      setNewMatchText('');
+      setNewExcludeText('');
+      setNewMatchRegex('');
+      setNewExcludeRegex('');
+      setNewExcludeWildcard(false);
     } catch (error) {
       setFormError(error instanceof Error ? error.message : '无法连接到后端服务');
     } finally {
@@ -1483,6 +1671,8 @@ export default function App() {
       || (result.business_message || '').toLowerCase().includes(query)
       || (result.response_preview || '').toLowerCase().includes(query);
   });
+  const showLegacyResultsTable = typeof window !== 'undefined'
+    && new URLSearchParams(window.location.search).has('legacy-results-table');
 
   const toggleResultExpanded = (id: number) => {
     setExpandedResultIds((current) => {
@@ -1508,6 +1698,91 @@ export default function App() {
 
   const formatBytes = (bytes: number) => bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
   const statusCodeClass = (code: number) => code < 300 ? 'status-2xx' : code < 400 ? 'status-3xx' : code < 500 ? 'status-4xx' : 'status-5xx';
+
+  const renderVirtualResult = (result: ScanResult, index: number, measureRow: VirtualRowMeasure) => {
+    const expanded = expandedResultIds.has(result.id);
+    const hasEvidence = hasResultEvidence(result);
+    return (
+      <React.Fragment key={result.id}>
+        <tr
+          className={`result-row ${index % 2 === 1 ? 'row-striped' : ''} ${expanded ? 'row-expanded' : ''}`}
+          aria-rowindex={index + 2}
+          ref={(node) => {
+            if (node) measureRow(result.id, 'base', node.getBoundingClientRect().height);
+          }}
+        >
+          <td className="cell-path" title={result.path}>
+            {hasEvidence && (
+              <button
+                type="button"
+                className={`cell-expand ${expanded ? 'active' : ''}`}
+                onClick={() => toggleResultExpanded(result.id)}
+                title={expanded ? '收起证据详情' : '展开业务错误与响应证据'}
+                aria-expanded={expanded}
+                aria-label={`展开或收起 ${result.path} 的证据详情`}
+              >
+                {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+              </button>
+            )}
+            <a className="cell-path-link" href={result.url} target="_blank" rel="noopener noreferrer" title="打开接口响应（JSON）" aria-label={`打开接口响应 ${result.path}`}>
+              <span>{result.path}</span><ExternalLink size={10} />
+            </a>
+          </td>
+          <td className="cell-method"><span className="method-badge">{result.request_method}</span></td>
+          <td><span className={`status-code-badge ${statusCodeClass(result.status)}`}>{result.status}</span></td>
+          <td><span className={`severity-badge severity-${result.severity || 'low'}`}>{severityText[result.severity || 'low']}</span></td>
+          <td className="cell-category">
+            <span>{categoryText[result.category] || result.category || '可访问'}</span>
+            {result.spa_fallback && <span className="tag-badge tag-spa" title="响应与基线指纹一致，可能是 SPA 回退页而非真实目录">SPA</span>}
+          </td>
+          <td className="cell-business">
+            {result.business_code !== null && result.business_code !== undefined && (
+              <span className={`tag-badge tag-biz ${result.business_code !== 0 ? 'tag-biz-error' : ''}`} title="业务返回码">
+                业务码 {result.business_code}
+              </span>
+            )}
+            {result.business_message && (
+              <span className="cell-business-message" title={result.business_message}>{result.business_message}</span>
+            )}
+            {!hasEvidence && <span className="cell-muted">-</span>}
+          </td>
+          <td className="cell-redirect" title={result.redirect_location || undefined}>{result.redirect_location || '-'}</td>
+          <td className="cell-size">{result.length.toLocaleString()} B</td>
+          <td className="cell-content-type">{result.content_type || '-'}</td>
+          <td className="cell-time">{result.response_time} ms</td>
+          <td className="cell-url">{formatTime(result.discovered_at)}</td>
+        </tr>
+        {expanded && hasEvidence && (
+          <tr
+            className="evidence-row"
+            ref={(node) => {
+              if (node) measureRow(result.id, 'evidence', node.getBoundingClientRect().height);
+            }}
+          >
+            <td colSpan={11}>
+              <div className="evidence-grid">
+              <div className="evidence-block">
+                <div className="evidence-title">响应预览 <span className="evidence-hash">{result.body_hash ? `sha256:${result.body_hash}` : ''}</span></div>
+                <pre className="evidence-preview">{result.response_preview || '（无响应体）'}</pre>
+              </div>
+              <div className="evidence-block">
+                <div className="evidence-title">业务信息</div>
+                <div className="evidence-facts">
+                  <span className="meta-label">业务码</span>
+                  <span className="meta-value">{result.business_code ?? '—'}</span>
+                  <span className="meta-label">业务消息</span>
+                  <span className="meta-value">{result.business_message || '—'}</span>
+                  <span className="meta-label">SPA 回退</span>
+                  <span className="meta-value">{result.spa_fallback ? '是（与基线指纹一致）' : '否'}</span>
+                </div>
+              </div>
+              </div>
+            </td>
+          </tr>
+        )}
+      </React.Fragment>
+    );
+  };
 
   const renderHistoryScan = (scan: Scan) => (
     <div className="history-scan-row" key={scan.id}>
@@ -1991,7 +2266,14 @@ export default function App() {
                         <span>{currentScan?.status === 'running' ? '扫描进行中，等待新结果' : '当前筛选条件下没有结果'}</span>
                       </div>
                     ) : (
-                      <table className="results-table">
+                      <>
+                      <VirtualizedResultsTable
+                          results={filteredResults}
+                          expandedResultIds={expandedResultIds}
+                          hasResultEvidence={hasResultEvidence}
+                          renderRow={renderVirtualResult}
+                        />
+                      {showLegacyResultsTable && (<table className="results-table">
                         <colgroup>
                           <col style={{ width: '180px' }} />
                           <col style={{ width: '72px' }} />
@@ -2081,7 +2363,8 @@ export default function App() {
                             );
                           })}
                         </tbody>
-                      </table>
+                      </table>)}
+                      </>
                     )}
                     {resultHasMore && (
                       <button className="load-more" onClick={() => selectedScanId && fetchResultPage(selectedScanId)}>加载下一批结果</button>
@@ -2379,6 +2662,53 @@ export default function App() {
                   />
                   <p className="form-hint">未指定 Content-Type 时请求体默认按 application/json 发送；{ENUM_PLACEHOLDER} 会被替换为当前字典或枚举值。</p>
                 </div>
+
+                <details className="advanced-request-options">
+                  <summary><ListFilter size={11} />设置代理与响应过滤</summary>
+                  <div className="advanced-options-content">
+                    <div className="advanced-options-grid">
+                      <label className="advanced-option-field" htmlFor="scan-retries">
+                        <span>失败重试次数</span>
+                        <input id="scan-retries" type="number" className="form-input" min="0" max="10" value={newMaxRetries} onChange={(event) => setNewMaxRetries(Math.max(0, Math.min(10, Number(event.target.value) || 0)))} disabled={submitting} />
+                      </label>
+                      <label className="advanced-option-field" htmlFor="scan-proxies">
+                        <span>代理地址</span>
+                        <input id="scan-proxies" className="form-input" placeholder="http://127.0.0.1:8080，可填多个" value={newProxies} onChange={(event) => setNewProxies(event.target.value)} disabled={submitting} />
+                      </label>
+                    </div>
+                    <div className="advanced-option-section">
+                      <div className="advanced-option-label">认证方式</div>
+                      <div className="preset-control" role="radiogroup" aria-label="认证方式">
+                        {(['none', 'basic', 'digest', 'bearer'] as AuthType[]).map((type) => (
+                          <button key={type} type="button" role="radio" aria-checked={newAuthType === type} className={newAuthType === type ? 'active' : ''} onClick={() => setNewAuthType(type)} disabled={submitting}>
+                            {{ none: '无', basic: 'Basic', digest: 'Digest', bearer: 'Bearer' }[type]}
+                          </button>
+                        ))}
+                      </div>
+                      {(newAuthType === 'basic' || newAuthType === 'digest') && (
+                        <div className="advanced-options-grid">
+                          <input className="form-input" aria-label="认证用户名" placeholder="用户名" value={newAuthUsername} onChange={(event) => setNewAuthUsername(event.target.value)} disabled={submitting} />
+                          <input className="form-input" aria-label="认证密码" type="password" placeholder="密码" value={newAuthPassword} onChange={(event) => setNewAuthPassword(event.target.value)} disabled={submitting} />
+                        </div>
+                      )}
+                      {newAuthType === 'bearer' && <input className="form-input" aria-label="Bearer Token" type="password" placeholder="Bearer Token" value={newAuthToken} onChange={(event) => setNewAuthToken(event.target.value)} disabled={submitting} />}
+                    </div>
+                    <div className="advanced-option-section">
+                      <div className="advanced-option-label">响应过滤</div>
+                      <div className="advanced-options-grid">
+                        <input className="form-input" aria-label="包含状态码" placeholder="包含状态码，如 200,403" value={newIncludeStatuses} onChange={(event) => setNewIncludeStatuses(event.target.value)} disabled={submitting} />
+                        <input className="form-input" aria-label="排除状态码" placeholder="排除状态码，如 404" value={newExcludeStatuses} onChange={(event) => setNewExcludeStatuses(event.target.value)} disabled={submitting} />
+                        <input className="form-input" aria-label="最小响应大小" type="number" min="0" placeholder="最小大小 B" value={newMinResponseSize || ''} onChange={(event) => setNewMinResponseSize(Math.max(0, Number(event.target.value) || 0))} disabled={submitting} />
+                        <input className="form-input" aria-label="最大响应大小" type="number" min="0" placeholder="最大大小 B，0 不限制" value={newMaxResponseSize || ''} onChange={(event) => setNewMaxResponseSize(Math.max(0, Number(event.target.value) || 0))} disabled={submitting} />
+                        <input className="form-input" aria-label="匹配正文" placeholder="正文必须包含" value={newMatchText} onChange={(event) => setNewMatchText(event.target.value)} disabled={submitting} />
+                        <input className="form-input" aria-label="排除正文" placeholder="正文不能包含" value={newExcludeText} onChange={(event) => setNewExcludeText(event.target.value)} disabled={submitting} />
+                        <input className="form-input" aria-label="匹配正则" placeholder="匹配正则表达式" value={newMatchRegex} onChange={(event) => setNewMatchRegex(event.target.value)} disabled={submitting} />
+                        <input className="form-input" aria-label="排除正则" placeholder="排除正则表达式" value={newExcludeRegex} onChange={(event) => setNewExcludeRegex(event.target.value)} disabled={submitting} />
+                      </div>
+                      <label className="advanced-checkbox"><input type="checkbox" checked={newExcludeWildcard} onChange={(event) => setNewExcludeWildcard(event.target.checked)} disabled={submitting} /><span>过滤通配响应（软 404 / 重复页面）</span></label>
+                    </div>
+                  </div>
+                </details>
 
                 <div className="form-group">
                   <div className="form-label" id="scan-preset-label"><Gauge size={11} />扫描策略</div>

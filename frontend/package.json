@@ -41,6 +41,7 @@
   "build": {
     "appId": "com.seahare.app",
     "productName": "Seahare",
+    "icon": "build/icon.ico",
     "directories": {
       "output": "dist-electron"
     },

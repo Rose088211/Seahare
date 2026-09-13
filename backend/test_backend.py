@@ -38,6 +38,37 @@ class EvidenceTargetHandler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(body)
 
 
+class RequestOptionsTargetHandler(BaseHTTPRequestHandler):
+    def log_message(self, *_): pass
+
+    def do_GET(self):
+        path = self.path.split("?", 1)[0]
+        if path == "/retry":
+            with self.server.retry_lock:
+                attempt = self.server.retry_attempts.get(path, 0) + 1
+                self.server.retry_attempts[path] = attempt
+            if attempt == 1:
+                self.connection.close()
+                return
+        if path == "/" or path.startswith("/.seahare-wildcard-") or path == "/wild":
+            status, content_type, body = 200, "text/html", b"not found shell"
+        elif path == "/good":
+            status, content_type, body = 200, "text/plain", b"admin panel ready"
+        elif path == "/forbidden":
+            status, content_type, body = 403, "text/plain", b"protected"
+        elif path == "/small":
+            status, content_type, body = 200, "text/plain", b"x"
+        elif path == "/retry":
+            status, content_type, body = 200, "text/plain", b"retry success"
+        else:
+            status, content_type, body = 404, "text/plain", b"missing"
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
 class AutoMethodTargetHandler(BaseHTTPRequestHandler):
     def log_message(self, *_): pass
 
@@ -69,6 +100,135 @@ class AutoMethodTargetHandler(BaseHTTPRequestHandler):
 
 
 class BackendTests(unittest.TestCase):
+    def test_request_options_are_normalized_and_public_credentials_are_hidden(self):
+        options = server_module.normalize_request_options({
+            "max_retries": 99,
+            "proxies": "127.0.0.1:8080\nhttps://proxy.example:8443, 127.0.0.1:8080",
+            "auth": {"type": "basic", "username": "demo", "password": "secret"},
+            "response_filters": {
+                "include_status_codes": "200, 403  500",
+                "exclude_status_codes": [404, 404],
+                "min_size": "2",
+                "max_size": 200,
+                "match_text": "admin",
+                "match_regex": r"admin\s+panel",
+                "exclude_wildcard": True,
+            },
+        })
+        self.assertEqual(options["max_retries"], server_module.MAX_RETRIES)
+        self.assertEqual(options["proxies"], ["http://127.0.0.1:8080", "https://proxy.example:8443"])
+        self.assertEqual(options["response_filters"]["include_status_codes"], [200, 403, 500])
+        self.assertEqual(options["response_filters"]["exclude_status_codes"], [404])
+        self.assertTrue(options["response_filters"]["exclude_wildcard"])
+
+        public = server_module.public_request_options(options)
+        public_text = server_module.json.dumps(public)
+        self.assertEqual(public["auth"], {"type": "basic"})
+        self.assertNotIn("secret", public_text)
+        self.assertNotIn("demo", public_text)
+
+        with self.assertRaises(ValueError):
+            server_module.normalize_request_options({"proxies": "ftp://proxy.example:21"})
+        with self.assertRaises(ValueError):
+            server_module.normalize_request_options({"auth": {"type": "bearer"}})
+        with self.assertRaises(ValueError):
+            server_module.normalize_request_options({"response_filters": {"match_regex": "["}})
+
+    def test_response_filters_cover_status_size_text_and_regex(self):
+        details = {"status": 200, "length": 16, "body_text": "admin panel ready"}
+        filters = server_module.normalize_request_options({"response_filters": {
+            "include_status_codes": "200 403",
+            "exclude_status_codes": "403",
+            "min_size": 10,
+            "max_size": 20,
+            "match_text": "admin",
+            "exclude_text": "forbidden",
+            "match_regex": r"admin\s+panel",
+            "exclude_regex": r"denied",
+        }})["response_filters"]
+        self.assertTrue(server_module.response_matches_filters(details, filters, False))
+        for changed in (
+            {**details, "status": 404},
+            {**details, "status": 403},
+            {**details, "length": 3},
+            {**details, "body_text": "public page"},
+            {**details, "body_text": "admin panel denied"},
+        ):
+            self.assertFalse(server_module.response_matches_filters(changed, filters, False))
+        self.assertFalse(server_module.response_matches_filters(
+            details, {**filters, "exclude_wildcard": True}, True,
+        ))
+
+    def test_wildcard_detection_retry_filtering_and_persistence(self):
+        target = ThreadingHTTPServer(("127.0.0.1", 0), RequestOptionsTargetHandler)
+        target.retry_attempts = {}
+        target.retry_lock = threading.Lock()
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        old_custom_dir = server_module.CUSTOM_DICTIONARY_DIR
+        try:
+            with tempfile.TemporaryDirectory() as folder:
+                server_module.CUSTOM_DICTIONARY_DIR = Path(folder) / "dictionaries"
+                server_module.CUSTOM_DICTIONARY_DIR.mkdir()
+                dictionary = server_module.CUSTOM_DICTIONARY_DIR / "request-options.txt"
+                dictionary.write_text("wild\ngood\nforbidden\nsmall\nretry\nmissing\n", encoding="utf-8")
+                store = Store(Path(folder) / "request-options.db")
+                try:
+                    manager = ScanManager(store)
+                    job = manager.create(
+                        f"http://127.0.0.1:{target.server_port}", dictionary.name, 2, 2,
+                        request_options={"max_retries": 1},
+                    )
+                    deadline = time.time() + 5
+                    while job.status not in ("completed", "failed") and time.time() < deadline:
+                        time.sleep(.05)
+                    self.assertEqual(job.status, "completed")
+                    self.assertGreaterEqual(target.retry_attempts.get("/retry", 0), 2)
+                    rows = {row["path"]: row for row in store.results(job.id)}
+                    self.assertTrue(rows["/wild"]["wildcard"])
+                    self.assertEqual(rows["/wild"]["category"], "wildcard")
+                    saved = store.scan(job.id)
+                    saved_options = server_module.json.loads(saved["request_options"])
+                    self.assertEqual(saved_options["max_retries"], 1)
+
+                    filtered = manager.create(
+                        f"http://127.0.0.1:{target.server_port}", dictionary.name, 2, 2,
+                        request_options={"response_filters": {"exclude_wildcard": True}},
+                    )
+                    deadline = time.time() + 5
+                    while filtered.status not in ("completed", "failed") and time.time() < deadline:
+                        time.sleep(.05)
+                    self.assertEqual(filtered.status, "completed")
+                    filtered_paths = {row["path"] for row in store.results(filtered.id)}
+                    self.assertNotIn("/wild", filtered_paths)
+                    self.assertIn("/good", filtered_paths)
+
+                    include_missing = manager.create(
+                        f"http://127.0.0.1:{target.server_port}", dictionary.name, 2, 2,
+                        request_options={"response_filters": {"include_status_codes": "404"}},
+                    )
+                    deadline = time.time() + 5
+                    while include_missing.status not in ("completed", "failed") and time.time() < deadline:
+                        time.sleep(.05)
+                    self.assertEqual(include_missing.status, "completed")
+                    self.assertTrue(all(row["status"] == 404 for row in store.results(include_missing.id)))
+                    self.assertGreaterEqual(len(store.results(include_missing.id)), 1)
+                finally:
+                    store.close()
+
+                reopened = Store(Path(folder) / "request-options.db")
+                try:
+                    persisted = {row["path"]: row for row in reopened.results(job.id)}
+                    self.assertTrue(persisted["/wild"]["wildcard"])
+                    public_scans = reopened.list_scans()
+                    persisted_scan = next(row for row in public_scans if row["id"] == job.id)
+                    self.assertEqual(persisted_scan["request_options"]["max_retries"], 1)
+                    self.assertNotIn("password", server_module.json.dumps(persisted_scan))
+                finally:
+                    reopened.close()
+        finally:
+            server_module.CUSTOM_DICTIONARY_DIR = old_custom_dir
+            target.shutdown(); target.server_close()
+
     def test_development_dictionary_directory_is_separate(self):
         with tempfile.TemporaryDirectory() as folder:
             data_dir = Path(folder)

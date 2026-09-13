@@ -6,11 +6,14 @@ can be bundled into a Windows desktop application without a dependency tree.
 from __future__ import annotations
 
 import csv
+import difflib
 import hashlib
 import io
 import itertools
 import json
 import os
+import random
+import re
 import sqlite3
 import sys
 import threading
@@ -22,9 +25,11 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+import requests
+from requests.adapters import HTTPAdapter
+from requests.auth import HTTPBasicAuth, HTTPDigestAuth
 
 ROOT = Path(__file__).resolve().parent
 FROZEN = bool(getattr(sys, "frozen", False))
@@ -70,6 +75,25 @@ REQUEST_METHODS = {"AUTO", "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPT
 AUTO_METHODS = ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
 METHODS_WITH_BODY = {"POST", "PUT", "PATCH", "DELETE"}
 TARGET_TYPES = {"web", "api", "h5"}
+AUTH_TYPES = {"none", "basic", "digest", "bearer"}
+MAX_RETRIES = 10
+MAX_RESPONSE_BYTES = 64 * 1024
+DEFAULT_REQUEST_OPTIONS = {
+    "max_retries": 0,
+    "proxies": [],
+    "auth": {"type": "none"},
+    "response_filters": {
+        "include_status_codes": [],
+        "exclude_status_codes": [],
+        "min_size": 0,
+        "max_size": 0,
+        "match_text": "",
+        "exclude_text": "",
+        "match_regex": "",
+        "exclude_regex": "",
+        "exclude_wildcard": False,
+    },
+}
 
 SENSITIVE_PATH_TOKENS = {
     "admin", "backup", "config", "database", "db", "dump", "env", "git",
@@ -80,6 +104,118 @@ AUTH_PATH_TOKENS = {"auth", "login", "oauth", "signin", "sso"}
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _copy_default_request_options() -> dict[str, Any]:
+    return json.loads(json.dumps(DEFAULT_REQUEST_OPTIONS))
+
+
+def _parse_int_list(value: Any, label: str) -> list[int]:
+    if value is None or value == "":
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else re.split(r"[\s,]+", str(value))
+    result = []
+    for item in values:
+        if item == "":
+            continue
+        try:
+            number = int(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{label} must contain HTTP status codes") from exc
+        if not 100 <= number <= 599:
+            raise ValueError(f"{label} must contain status codes from 100 to 599")
+        result.append(number)
+    return sorted(set(result))
+
+
+def normalize_request_options(raw: Any) -> dict[str, Any]:
+    options = _copy_default_request_options()
+    if raw in (None, ""):
+        return options
+    if not isinstance(raw, dict):
+        raise ValueError("request_options must be an object")
+
+    try:
+        options["max_retries"] = max(0, min(int(raw.get("max_retries", 0)), MAX_RETRIES))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("max_retries must be an integer") from exc
+
+    raw_proxies = raw.get("proxies", raw.get("proxy", []))
+    if isinstance(raw_proxies, str):
+        raw_proxies = re.split(r"[\r\n,]+", raw_proxies)
+    if raw_proxies is None:
+        raw_proxies = []
+    if not isinstance(raw_proxies, (list, tuple)):
+        raise ValueError("proxies must be a list or a comma/newline separated string")
+    proxies = []
+    for value in raw_proxies:
+        proxy = str(value).strip()
+        if not proxy:
+            continue
+        parsed = urlparse(proxy if "://" in proxy else f"http://{proxy}")
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError("only HTTP and HTTPS proxies are supported")
+        proxies.append(proxy if "://" in proxy else f"http://{proxy}")
+    options["proxies"] = list(dict.fromkeys(proxies))
+
+    raw_auth = raw.get("auth", {})
+    if raw_auth is None:
+        raw_auth = {}
+    if not isinstance(raw_auth, dict):
+        raise ValueError("auth must be an object")
+    auth_type = str(raw_auth.get("type", "none") or "none").lower()
+    if auth_type not in AUTH_TYPES:
+        raise ValueError(f"auth type must be one of {', '.join(sorted(AUTH_TYPES))}")
+    auth = {"type": auth_type}
+    if auth_type in ("basic", "digest"):
+        auth["username"] = str(raw_auth.get("username", ""))
+        auth["password"] = str(raw_auth.get("password", ""))
+        if not auth["username"]:
+            raise ValueError("username is required for basic or digest authentication")
+    elif auth_type == "bearer":
+        auth["token"] = str(raw_auth.get("token", ""))
+        if not auth["token"]:
+            raise ValueError("token is required for bearer authentication")
+    options["auth"] = auth
+
+    raw_filters = raw.get("response_filters", {})
+    if raw_filters is None:
+        raw_filters = {}
+    if not isinstance(raw_filters, dict):
+        raise ValueError("response_filters must be an object")
+    filters = options["response_filters"]
+    filters["include_status_codes"] = _parse_int_list(raw_filters.get("include_status_codes"), "include_status_codes")
+    filters["exclude_status_codes"] = _parse_int_list(raw_filters.get("exclude_status_codes"), "exclude_status_codes")
+    for key in ("min_size", "max_size"):
+        try:
+            filters[key] = max(0, int(raw_filters.get(key, 0) or 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a non-negative integer") from exc
+    if filters["max_size"] and filters["max_size"] < filters["min_size"]:
+        raise ValueError("max_size must be greater than or equal to min_size")
+    for key in ("match_text", "exclude_text", "match_regex", "exclude_regex"):
+        value = str(raw_filters.get(key, "") or "")
+        if len(value) > 1000:
+            raise ValueError(f"{key} is too long")
+        if key.endswith("regex") and value:
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ValueError(f"{key} is not a valid regular expression") from exc
+        filters[key] = value
+    filters["exclude_wildcard"] = bool(raw_filters.get("exclude_wildcard", False))
+    return options
+
+
+def public_request_options(options: Any) -> dict[str, Any]:
+    normalized = normalize_request_options(options)
+    auth = {"type": normalized["auth"]["type"]}
+    return {
+        "max_retries": normalized["max_retries"],
+        "proxies": ["***" if "@" in proxy.split("://", 1)[-1].split("/", 1)[0] else proxy for proxy in normalized["proxies"]],
+        "auth": auth,
+        "response_filters": normalized["response_filters"],
+    }
 
 
 def inspect_response(body: bytes) -> tuple[str, str, int | None, str]:
@@ -107,11 +243,66 @@ def inspect_response(body: bytes) -> tuple[str, str, int | None, str]:
     return preview, digest, business_code, business_message
 
 
+def _normalized_body(text: str) -> str:
+    text = re.sub(r"[0-9a-f]{8}-[0-9a-f-]{27,}", "{dynamic}", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b\d{8,}\b", "{dynamic}", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def body_similarity(left: str, right: str) -> float:
+    if left == right:
+        return 1.0
+    if not left or not right:
+        return 0.0
+    largest = max(len(left), len(right))
+    if abs(len(left) - len(right)) / largest > 0.35:
+        return 0.0
+    return difflib.SequenceMatcher(None, _normalized_body(left), _normalized_body(right), autojunk=False).quick_ratio()
+
+
+def wildcard_match(profile: list[dict[str, Any]], details: dict[str, Any]) -> bool:
+    if not profile:
+        return False
+    for sample in profile:
+        if details["status"] != sample["status"] or details["content_type"] != sample["content_type"]:
+            continue
+        if bool(details["redirect_location"]) != bool(sample["redirect_location"]):
+            continue
+        if details["body_hash"] == sample["body_hash"] or body_similarity(details["body_text"], sample["body_text"]) >= 0.96:
+            return True
+    return False
+
+
+def response_matches_filters(
+    details: dict[str, Any], filters: dict[str, Any], is_wildcard: bool,
+) -> bool:
+    status = details["status"]
+    length = details["length"]
+    if filters["include_status_codes"] and status not in filters["include_status_codes"]:
+        return False
+    if status in filters["exclude_status_codes"]:
+        return False
+    if length < filters["min_size"] or (filters["max_size"] and length > filters["max_size"]):
+        return False
+    text = details["body_text"]
+    if filters["match_text"] and filters["match_text"] not in text:
+        return False
+    if filters["exclude_text"] and filters["exclude_text"] in text:
+        return False
+    if filters["match_regex"] and not re.search(filters["match_regex"], text):
+        return False
+    if filters["exclude_regex"] and re.search(filters["exclude_regex"], text):
+        return False
+    return not (is_wildcard and filters["exclude_wildcard"])
+
+
 def classify_result(
     path: str, status: int, business_code: int | None = None,
-    spa_fallback: bool = False,
+    spa_fallback: bool = False, wildcard: bool = False,
 ) -> tuple[str, str]:
     tokens = {token for token in path.lower().replace(".", "/").replace("-", "/").split("/") if token}
+    if wildcard:
+        return "wildcard", "info"
     if spa_fallback:
         return "spa_fallback", "info"
     if tokens & SENSITIVE_PATH_TOKENS:
@@ -132,6 +323,7 @@ def classify_result(
 def public_result(row: dict[str, Any]) -> dict[str, Any]:
     result = dict(row)
     result["spa_fallback"] = bool(result.get("spa_fallback", 0))
+    result["wildcard"] = bool(result.get("wildcard", 0))
     return result
 
 
@@ -144,6 +336,17 @@ def public_scan(row: dict[str, Any]) -> dict[str, Any]:
         except (TypeError, ValueError):
             parsed = {}
         result["request_headers"] = parsed if isinstance(parsed, dict) else {}
+    raw_options = result.get("request_options", {})
+    if isinstance(raw_options, str):
+        try:
+            raw_options = json.loads(raw_options or "{}")
+        except (TypeError, ValueError):
+            raw_options = {}
+    result["request_options"] = public_request_options(raw_options)
+    result["max_retries"] = result["request_options"]["max_retries"]
+    result["proxies"] = result["request_options"]["proxies"]
+    result["auth_type"] = result["request_options"]["auth"]["type"]
+    result["response_filters"] = result["request_options"]["response_filters"]
     return result
 
 
@@ -201,6 +404,7 @@ class ScanJob:
     request_method: str = "GET"
     request_headers: dict[str, str] = field(default_factory=dict)
     request_body: str = ""
+    request_options: dict[str, Any] = field(default_factory=_copy_default_request_options)
     preset: str = "custom"
     mode: str = "dictionary"
     charset: str = ""
@@ -224,6 +428,11 @@ class ScanJob:
             "threads": self.threads, "timeout": self.timeout, "preset": self.preset,
             "target_type": self.target_type, "request_method": self.request_method,
             "request_headers": self.request_headers, "request_body": self.request_body,
+            "request_options": public_request_options(self.request_options),
+            "max_retries": self.request_options["max_retries"],
+            "proxies": public_request_options(self.request_options)["proxies"],
+            "auth_type": self.request_options["auth"]["type"],
+            "response_filters": self.request_options["response_filters"],
             "mode": self.mode, "charset": self.charset,
             "min_len": self.min_len, "max_len": self.max_len, "placeholder": self.placeholder,
             "status": self.status,
@@ -249,6 +458,7 @@ class Store:
                 max_len INTEGER NOT NULL DEFAULT 1, placeholder TEXT NOT NULL DEFAULT '{fuzz}',
                 target_type TEXT NOT NULL DEFAULT 'web', request_method TEXT NOT NULL DEFAULT 'GET',
                 request_headers TEXT NOT NULL DEFAULT '{}', request_body TEXT NOT NULL DEFAULT '',
+                request_options TEXT NOT NULL DEFAULT '{}',
                 status TEXT NOT NULL,
                 progress REAL NOT NULL, requests INTEGER NOT NULL, found INTEGER NOT NULL,
                 created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT
@@ -261,7 +471,7 @@ class Store:
                 severity TEXT NOT NULL DEFAULT 'low', redirect_location TEXT NOT NULL DEFAULT '',
                 business_code INTEGER, business_message TEXT NOT NULL DEFAULT '',
                 response_preview TEXT NOT NULL DEFAULT '', body_hash TEXT NOT NULL DEFAULT '',
-                spa_fallback INTEGER NOT NULL DEFAULT 0,
+                spa_fallback INTEGER NOT NULL DEFAULT 0, wildcard INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(scan_id, path, request_method)
               );
               CREATE INDEX IF NOT EXISTS idx_results_scan ON results(scan_id, id);
@@ -276,6 +486,7 @@ class Store:
             self._ensure_column("scans", "request_method", "TEXT NOT NULL DEFAULT 'GET'")
             self._ensure_column("scans", "request_headers", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("scans", "request_body", "TEXT NOT NULL DEFAULT ''")
+            self._ensure_column("scans", "request_options", "TEXT NOT NULL DEFAULT '{}'")
             self._ensure_column("results", "category", "TEXT NOT NULL DEFAULT 'accessible'")
             self._ensure_column("results", "severity", "TEXT NOT NULL DEFAULT 'low'")
             self._ensure_column("results", "redirect_location", "TEXT NOT NULL DEFAULT ''")
@@ -285,6 +496,7 @@ class Store:
             self._ensure_column("results", "response_preview", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("results", "body_hash", "TEXT NOT NULL DEFAULT ''")
             self._ensure_column("results", "spa_fallback", "INTEGER NOT NULL DEFAULT 0")
+            self._ensure_column("results", "wildcard", "INTEGER NOT NULL DEFAULT 0")
             self._migrate_result_key()
             self.conn.execute(
                 """UPDATE scans SET status='interrupted', finished_at=?,
@@ -292,9 +504,9 @@ class Store:
                    WHERE status IN ('queued','running','paused','cancelling')""",
                 (now(),),
             )
-            for row in self.conn.execute("SELECT id,path,status,business_code,spa_fallback FROM results"):
+            for row in self.conn.execute("SELECT id,path,status,business_code,spa_fallback,wildcard FROM results"):
                 category, severity = classify_result(
-                    row["path"], row["status"], row["business_code"], bool(row["spa_fallback"])
+                    row["path"], row["status"], row["business_code"], bool(row["spa_fallback"]), bool(row["wildcard"])
                 )
                 self.conn.execute(
                     "UPDATE results SET category=?,severity=? WHERE id=?",
@@ -329,6 +541,7 @@ class Store:
             redirect_location TEXT NOT NULL DEFAULT '', business_code INTEGER,
             business_message TEXT NOT NULL DEFAULT '', response_preview TEXT NOT NULL DEFAULT '',
             body_hash TEXT NOT NULL DEFAULT '', spa_fallback INTEGER NOT NULL DEFAULT 0,
+            wildcard INTEGER NOT NULL DEFAULT 0,
             UNIQUE(scan_id, path, request_method)
           )
         """)
@@ -336,10 +549,10 @@ class Store:
           INSERT INTO results_v2
             (id,scan_id,path,url,request_method,status,length,content_type,response_time,
              discovered_at,category,severity,redirect_location,business_code,business_message,
-             response_preview,body_hash,spa_fallback)
+             response_preview,body_hash,spa_fallback,wildcard)
           SELECT id,scan_id,path,url,request_method,status,length,content_type,response_time,
              discovered_at,category,severity,redirect_location,business_code,business_message,
-             response_preview,body_hash,spa_fallback
+             response_preview,body_hash,spa_fallback,wildcard
           FROM results
         """)
         self.conn.execute("DROP TABLE results")
@@ -349,11 +562,12 @@ class Store:
     def save_scan(self, job: ScanJob) -> None:
         with self.lock, self.conn:
             self.conn.execute("""INSERT OR REPLACE INTO scans
-              (id,target,dictionary,threads,timeout,preset,mode,charset,min_len,max_len,placeholder,target_type,request_method,request_headers,request_body,status,progress,requests,found,created_at,started_at,finished_at,error)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+              (id,target,dictionary,threads,timeout,preset,mode,charset,min_len,max_len,placeholder,target_type,request_method,request_headers,request_body,request_options,status,progress,requests,found,created_at,started_at,finished_at,error)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 job.id, job.target, job.dictionary, job.threads, job.timeout,
                 job.preset, job.mode, job.charset, job.min_len, job.max_len, job.placeholder,
                 job.target_type, job.request_method, json.dumps(job.request_headers, ensure_ascii=False), job.request_body,
+                json.dumps(job.request_options, ensure_ascii=False),
                 job.status, job.progress, job.requests, job.found,
                 job.created_at, job.started_at, job.finished_at, job.error,
               ))
@@ -365,18 +579,19 @@ class Store:
 
     def add_result(self, scan_id: str, item: dict[str, Any]) -> bool:
         category, severity = classify_result(
-            item["path"], item["status"], item.get("business_code"), item.get("spa_fallback", False)
+            item["path"], item["status"], item.get("business_code"),
+            item.get("spa_fallback", False), item.get("wildcard", False),
         )
         with self.lock, self.conn:
             cursor = self.conn.execute("""INSERT OR IGNORE INTO results
-              (scan_id,path,url,request_method,status,length,content_type,response_time,discovered_at,category,severity,redirect_location,business_code,business_message,response_preview,body_hash,spa_fallback)
-              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+              (scan_id,path,url,request_method,status,length,content_type,response_time,discovered_at,category,severity,redirect_location,business_code,business_message,response_preview,body_hash,spa_fallback,wildcard)
+              VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 scan_id, item["path"], item["url"], item.get("request_method", "GET"), item["status"], item["length"],
                 item["content_type"], item["response_time"], now(), category, severity,
                 item.get("redirect_location", ""),
                 item.get("business_code"), item.get("business_message", ""),
                 item.get("response_preview", ""), item.get("body_hash", ""),
-                int(bool(item.get("spa_fallback", False))),
+                int(bool(item.get("spa_fallback", False))), int(bool(item.get("wildcard", False))),
             ))
             return cursor.rowcount > 0
 
@@ -467,6 +682,7 @@ class ScanManager:
         preset: str = "custom", enum: dict[str, Any] | None = None,
         target_type: str = "web", request_method: str = "GET",
         request_headers: dict[str, str] | None = None, request_body: str = "",
+        request_options: dict[str, Any] | None = None,
     ) -> ScanJob:
         parsed = urlparse(target if "://" in target else f"https://{target}")
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
@@ -493,6 +709,7 @@ class ScanManager:
         request_body = str(request_body or "")
         if len(request_body.encode("utf-8")) > 1_000_000:
             raise ValueError("request_body is too large")
+        normalized_options = normalize_request_options(request_options)
         if enum is not None:
             charset = "".join(dict.fromkeys(str(enum.get("charset") or "")))
             min_len = int(enum.get("min_len", 1)); max_len = int(enum.get("max_len", 1))
@@ -511,6 +728,7 @@ class ScanManager:
                 uuid.uuid4().hex, target, "", threads, timeout, preset=preset,
                 target_type=target_type, request_method=request_method,
                 request_headers=normalized_headers, request_body=request_body,
+                request_options=normalized_options,
                 mode="enum", charset=charset, min_len=min_len, max_len=max_len,
                 placeholder=placeholder,
             )
@@ -522,6 +740,7 @@ class ScanManager:
                 uuid.uuid4().hex, target, path.name, threads, timeout, preset=preset,
                 target_type=target_type, request_method=request_method,
                 request_headers=normalized_headers, request_body=request_body,
+                request_options=normalized_options,
             )
         with self.lock:
             self.jobs[job.id] = job
@@ -533,6 +752,7 @@ class ScanManager:
         with self.lock: return self.jobs.get(scan_id)
 
     def _run(self, job: ScanJob) -> None:
+        session: requests.Session | None = None
         try:
             if job.mode == "enum":
                 placeholder_count = job.target.count(job.placeholder)
@@ -547,11 +767,24 @@ class ScanManager:
             method_candidates = AUTO_METHODS if job.request_method == "AUTO" else (job.request_method,)
             total = word_total * len(method_candidates)
             job.status = "running"; job.started_at = now(); self.store.update_scan(job)
-            class NoRedirect(HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
-
-            opener = build_opener(NoRedirect)
+            session = requests.Session()
+            session.trust_env = False
+            adapter = HTTPAdapter(
+                pool_connections=job.threads,
+                pool_maxsize=job.threads,
+                max_retries=0,
+            )
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            auth = job.request_options["auth"]
+            if auth["type"] == "basic":
+                session.auth = HTTPBasicAuth(auth["username"], auth["password"])
+            elif auth["type"] == "digest":
+                session.auth = HTTPDigestAuth(auth["username"], auth["password"])
+            elif auth["type"] == "bearer":
+                session.headers.update({"Authorization": f"Bearer {auth['token']}"})
+            response_filters = job.request_options["response_filters"]
+            max_retries = job.request_options["max_retries"]
 
             def perform_request(url: str, method: str, body_text: str = "") -> dict[str, Any]:
                 headers = dict(job.request_headers)
@@ -562,42 +795,64 @@ class ScanManager:
                 if body_text and not any(name.lower() == "content-type" for name in headers):
                     headers["Content-Type"] = "application/json"
                 data = body_text.encode("utf-8") if body_text else None
-                started = time.perf_counter()
-                try:
-                    req = Request(url, data=data, headers=headers, method=method)
-                    with opener.open(req, timeout=job.timeout) as response:
-                        raw_body = response.read(65536)
-                        preview, body_hash, business_code, business_message = inspect_response(raw_body)
-                        return {
-                            "status": response.status,
-                            "content_type": response.headers.get_content_type(),
-                            "length": int(response.headers.get("Content-Length") or len(raw_body)),
-                            "redirect_location": response.headers.get("Location", ""),
-                            "response_preview": preview, "body_hash": body_hash,
-                            "business_code": business_code, "business_message": business_message,
-                            "response_time": round((time.perf_counter() - started) * 1000, 1),
-                        }
-                except HTTPError as exc:
-                    raw_body = exc.read(65536)
-                    preview, body_hash, business_code, business_message = inspect_response(raw_body)
-                    return {
-                        "status": exc.code,
-                        "content_type": exc.headers.get_content_type() if exc.headers else "",
-                        "length": int(exc.headers.get("Content-Length") or len(raw_body)) if exc.headers else len(raw_body),
-                        "redirect_location": exc.headers.get("Location", "") if exc.headers else "",
-                        "response_preview": preview, "body_hash": body_hash,
-                        "business_code": business_code, "business_message": business_message,
-                        "response_time": round((time.perf_counter() - started) * 1000, 1),
-                    }
+                for attempt in range(max_retries + 1):
+                    started = time.perf_counter()
+                    proxy = random.choice(job.request_options["proxies"]) if job.request_options["proxies"] else None
+                    proxies = {"http": proxy, "https": proxy} if proxy else None
+                    try:
+                        response = session.request(
+                            method, url, data=data, headers=headers,
+                            timeout=job.timeout, allow_redirects=False,
+                            proxies=proxies, stream=True,
+                        )
+                        try:
+                            chunks: list[bytes] = []
+                            captured = 0
+                            for chunk in response.iter_content(chunk_size=8192):
+                                if not chunk:
+                                    continue
+                                remaining = MAX_RESPONSE_BYTES - captured
+                                chunks.append(chunk[:remaining])
+                                captured += min(len(chunk), remaining)
+                                if captured >= MAX_RESPONSE_BYTES:
+                                    break
+                            raw_body = b"".join(chunks)
+                            preview, body_hash, business_code, business_message = inspect_response(raw_body)
+                            body_text_value = raw_body.decode("utf-8", errors="replace")
+                            try:
+                                length = int(response.headers.get("Content-Length") or len(raw_body))
+                            except (TypeError, ValueError):
+                                length = len(raw_body)
+                            return {
+                                "status": response.status_code,
+                                "content_type": response.headers.get("Content-Type", "").split(";", 1)[0].strip(),
+                                "length": length,
+                                "redirect_location": response.headers.get("Location", ""),
+                                "response_preview": preview, "body_hash": body_hash,
+                                "body_text": body_text_value,
+                                "business_code": business_code, "business_message": business_message,
+                                "response_time": round((time.perf_counter() - started) * 1000, 1),
+                            }
+                        finally:
+                            response.close()
+                    except requests.RequestException:
+                        if attempt >= max_retries:
+                            raise
+                        time.sleep(min(0.2 * (2 ** attempt), 2.0))
 
             baseline_hash = ""
             baseline_path = urlparse(job.target).path or "/"
+            wildcard_profile: list[dict[str, Any]] = []
             if job.request_method in ("GET", "AUTO"):
                 try:
                     baseline = perform_request(job.target, "GET")
                     if baseline["status"] < 300 and baseline["content_type"] == "text/html":
                         baseline_hash = baseline["body_hash"]
-                except (URLError, TimeoutError, OSError):
+                    if job.mode != "enum":
+                        for _ in range(2):
+                            random_path = f"/.seahare-wildcard-{uuid.uuid4().hex}"
+                            wildcard_profile.append(perform_request(job.target.rstrip("/") + random_path, "GET"))
+                except requests.RequestException:
                     pass
 
             def probe(request) -> None:
@@ -625,10 +880,20 @@ class ScanManager:
                 try:
                     request_payload = body_text if request_method in METHODS_WITH_BODY else ""
                     details = perform_request(url, request_method, request_payload)
-                except (URLError, TimeoutError, OSError) as exc: error = str(exc)
+                except requests.RequestException as exc: error = str(exc)
                 finally:
                     with self.lock: job.requests += 1
-                    if error is None and details is not None and details["status"] and (details["status"] < 400 or details["status"] in (401, 403, 500)):
+                    status_is_candidate = (
+                        details["status"] < 400
+                        or details["status"] in (401, 403, 500)
+                        or details["status"] in response_filters["include_status_codes"]
+                    ) if details is not None else False
+                    if error is None and details is not None and status_is_candidate:
+                        is_wildcard = wildcard_match(wildcard_profile, details)
+                        if not response_matches_filters(details, response_filters, is_wildcard):
+                            with self.lock: job.progress = job.requests / total if total else 1.0
+                            self.store.update_scan(job)
+                            return
                         spa_fallback = bool(
                             baseline_hash and details["body_hash"] == baseline_hash
                             and details["content_type"] == "text/html"
@@ -645,16 +910,20 @@ class ScanManager:
                             "business_code": details["business_code"],
                             "business_message": details["business_message"],
                             "spa_fallback": spa_fallback,
+                            "wildcard": is_wildcard,
                         }
                         if self.store.add_result(job.id, item):
                             with self.lock: job.found += 1
                     with self.lock: job.progress = job.requests / total if total else 1.0
                     self.store.update_scan(job)
-            requests = ((word, method) for word in words for method in method_candidates)
-            with ThreadPoolExecutor(max_workers=job.threads) as pool: list(pool.map(probe, requests))
+            request_items = ((word, method) for word in words for method in method_candidates)
+            with ThreadPoolExecutor(max_workers=job.threads) as pool: list(pool.map(probe, request_items))
             job.status = "cancelled" if job.cancel_event.is_set() else "completed"; job.progress = 1.0 if job.status == "completed" else job.progress
         except Exception as exc: job.status = "failed"; job.error = str(exc)
-        finally: job.finished_at = now(); self.store.update_scan(job)
+        finally:
+            if session is not None:
+                session.close()
+            job.finished_at = now(); self.store.update_scan(job)
 
     def action(self, scan_id: str, action: str) -> ScanJob:
         job = self.get(scan_id)
@@ -689,6 +958,7 @@ class ScanManager:
                 request_method=saved.get("request_method", "GET"),
                 request_headers=json.loads(saved.get("request_headers") or "{}"),
                 request_body=saved.get("request_body", ""),
+                request_options=json.loads(saved.get("request_options") or "{}"),
             )
         return self.create(
             saved["target"], saved["dictionary"], saved["threads"], saved["timeout"],
@@ -697,6 +967,7 @@ class ScanManager:
             request_method=saved.get("request_method", "GET"),
             request_headers=json.loads(saved.get("request_headers") or "{}"),
             request_body=saved.get("request_body", ""),
+            request_options=json.loads(saved.get("request_options") or "{}"),
         )
 
 
@@ -792,7 +1063,7 @@ class Handler(BaseHTTPRequestHandler):
                     rows = STORE.results(parts[2]); output = io.StringIO(); fields = [
                         "path", "url", "request_method", "status", "severity", "category", "redirect_location",
                         "business_code", "business_message", "response_preview", "body_hash",
-                        "spa_fallback", "length", "content_type", "response_time", "discovered_at",
+                         "spa_fallback", "wildcard", "length", "content_type", "response_time", "discovered_at",
                     ]; writer = csv.DictWriter(output, fieldnames=fields); writer.writeheader(); writer.writerows({key: row[key] for key in fields} for row in rows); raw = output.getvalue().encode(); self.send_response(200); self.send_header("Content-Type", "text/csv; charset=utf-8"); self.send_header("Content-Disposition", f"attachment; filename=seahare-{parts[2]}.csv"); self.send_header("Content-Length", str(len(raw))); self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers(); self.wfile.write(raw); return
             self.send_json({"error": "not found"}, 404)
         except Exception as exc: self.send_json({"error": str(exc)}, 500)
@@ -814,6 +1085,7 @@ class Handler(BaseHTTPRequestHandler):
                         request_method=payload.get("request_method", "GET"),
                         request_headers=payload.get("request_headers", {}),
                         request_body=payload.get("request_body", ""),
+                        request_options=payload.get("request_options", {}),
                     )
                 else:
                     job = MANAGER.create(
@@ -826,6 +1098,7 @@ class Handler(BaseHTTPRequestHandler):
                         request_method=payload.get("request_method", "GET"),
                         request_headers=payload.get("request_headers", {}),
                         request_body=payload.get("request_body", ""),
+                        request_options=payload.get("request_options", {}),
                     )
                 return self.send_json(job.public(), 201)
             if parsed.path == "/api/dictionaries":

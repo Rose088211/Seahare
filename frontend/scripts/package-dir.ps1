@@ -58,6 +58,12 @@ try {
 Copy-Item -Path (Join-Path $FrontendRoot "dist") -Destination $AppDir -Recurse -Force
 Copy-Item -Path (Join-Path $FrontendRoot "electron") -Destination $AppDir -Recurse -Force
 Copy-Item -LiteralPath (Join-Path $FrontendRoot "package.json") -Destination $AppDir -Force
+$IconPng = Join-Path $FrontendRoot "build\icon.png"
+$IconIco = Join-Path $FrontendRoot "build\icon.ico"
+if (-not (Test-Path -LiteralPath $IconPng) -or -not (Test-Path -LiteralPath $IconIco)) {
+    throw "Seahare icon resources are missing. Expected frontend/build/icon.png and frontend/build/icon.ico."
+}
+Copy-Item -Path (Join-Path $FrontendRoot "build") -Destination $AppDir -Recurse -Force
 Copy-Item -LiteralPath $BackendExe -Destination (Join-Path $BackendDir "seahare-backend.exe") -Force
 
 # Copy node-pty for PTY helper (required at runtime, not in node_modules in production)
@@ -98,7 +104,7 @@ if ((Test-Path -LiteralPath $Rcedit) -and (Test-Path -LiteralPath $Icon)) {
     & $Rcedit $SeahareExe --set-icon $Icon | Out-Null
     if ($LASTEXITCODE -ne 0) { Write-Host "WARNING: failed to embed icon into Seahare.exe" }
 } else {
-    Write-Host "WARNING: rcedit or icon.ico missing, skipping icon embed"
+    throw "rcedit or icon.ico missing; refusing to produce an unbranded Seahare.exe"
 }
 
 Write-Host "Desktop directory package: $SeahareExe"

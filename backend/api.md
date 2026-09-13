@@ -58,6 +58,39 @@ an optional UTF-8 body. A body automatically receives
 Results include the actual `request_method` and are unique by scan, path, and
 method.
 
+Optional `request_options` adds request-engine controls:
+
+```json
+{
+  "max_retries": 2,
+  "proxies": ["http://127.0.0.1:8080"],
+  "auth": { "type": "basic", "username": "demo", "password": "secret" },
+  "response_filters": {
+    "include_status_codes": [200, 403],
+    "exclude_status_codes": [404],
+    "min_size": 0,
+    "max_size": 0,
+    "match_text": "admin",
+    "exclude_text": "not found",
+    "match_regex": "",
+    "exclude_regex": "",
+    "exclude_wildcard": false
+  }
+}
+```
+
+`max_retries` is limited to 10 and only retries transport/request errors;
+HTTP status responses are not retried. Proxies may be HTTP or HTTPS and are
+rotated per attempt. Supported authentication types are `none`, `basic`,
+`digest`, and `bearer`. Credentials are stored for retry but are not returned
+by the public scan payload.
+
+For dictionary scans, Seahare requests two random paths before probing to build
+a wildcard/soft-404 profile. Matching responses are marked with `wildcard`;
+`exclude_wildcard` removes them before they are saved. The profile compares
+status, content type, redirect presence, bounded body hashes, and normalized
+body similarity.
+
 Custom enumeration mode generates path combinations from a charset instead of
 reading a dictionary file. The target must contain the `{fuzz}` placeholder,
 which is replaced by each combination. `min_len`/`max_len` bound the lengths
@@ -168,6 +201,8 @@ Each result keeps the v1 fields and adds `request_method`, `severity`, `category
 `redirect_location`, `business_code`, `business_message`, `response_preview`,
 `body_hash`, and `spa_fallback`. `business_code` and `business_message` are
 read from common JSON fields such as `errno`/`errmsg` or `code`/`message`.
+Results also include `wildcard`; an explicit `include_status_codes` filter can
+retain statuses such as 404 that are ignored by the default candidate policy.
 `spa_fallback` is true when an HTML response has the same bounded body
 fingerprint as the scan target baseline, which commonly indicates a single-page
 application fallback rather than a real directory. Redirect responses are

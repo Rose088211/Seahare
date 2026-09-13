@@ -25,6 +25,25 @@ interface Tab {
   openOnMount?: boolean;
 }
 
+interface NoteSnapshot {
+  content: string;
+  path: string | null;
+  name: string;
+  preview: boolean;
+}
+
+interface BrowserSnapshot {
+  url: string;
+  src: string;
+}
+
+interface WorkspaceSnapshot {
+  tabs: Tab[];
+  activeId: string | null;
+  mode: PanelMode;
+  pos: { x: number; y: number };
+}
+
 export interface FloatingWorkspaceHandle {
   addTab(kind: TabKind, opts?: { openOnMount?: boolean }): void;
   minimize(): void;
@@ -88,6 +107,60 @@ const defaultTitle = (kind: TabKind, n: number) =>
   kind === 'terminal' ? `终端 ${n}` : kind === 'note' ? `笔记 ${n}` : `浏览器 ${n}`;
 const tabIcon = (kind: TabKind) =>
   kind === 'terminal' ? <TerminalSquare size={11} /> : kind === 'note' ? <FileText size={11} /> : <Globe size={11} />;
+
+const WORKSPACE_STORAGE_KEY = 'seahare-floating-workspace';
+const TAB_STORAGE_PREFIX = 'seahare-floating-tab:';
+
+const isTabKind = (value: unknown): value is TabKind =>
+  value === 'terminal' || value === 'note' || value === 'browser';
+
+const readTabSnapshot = <T,>(tabId: string, kind: TabKind): T | null => {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(`${TAB_STORAGE_PREFIX}${kind}:${tabId}`);
+    return raw ? JSON.parse(raw) as T : null;
+  } catch {
+    return null;
+  }
+};
+
+const writeTabSnapshot = (tabId: string, kind: TabKind, value: unknown) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(`${TAB_STORAGE_PREFIX}${kind}:${tabId}`, JSON.stringify(value));
+  } catch {
+    // Local persistence is best effort; the current in-memory session still works.
+  }
+};
+
+const removeTabSnapshot = (tabId: string, kind: TabKind) => {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(`${TAB_STORAGE_PREFIX}${kind}:${tabId}`);
+  } catch {
+    /* best effort */
+  }
+};
+
+const loadWorkspaceSnapshot = (): WorkspaceSnapshot => {
+  const fallback: WorkspaceSnapshot = { tabs: [], activeId: null, mode: 'min', pos: { x: 0, y: 0 } };
+  if (typeof window === 'undefined') return fallback;
+  try {
+    const parsed = JSON.parse(window.localStorage.getItem(WORKSPACE_STORAGE_KEY) || 'null') as Partial<WorkspaceSnapshot> | null;
+    if (!parsed || !Array.isArray(parsed.tabs)) return fallback;
+    const tabs = parsed.tabs.filter((tab): tab is Tab => Boolean(
+      tab && typeof tab === 'object' && typeof tab.id === 'string' && typeof tab.title === 'string' && isTabKind(tab.kind),
+    ));
+    const activeId = tabs.some((tab) => tab.id === parsed.activeId) ? parsed.activeId! : tabs[0]?.id ?? null;
+    const mode = parsed.mode === 'normal' || parsed.mode === 'max' || parsed.mode === 'min' ? parsed.mode : 'min';
+    const pos = parsed.pos && Number.isFinite(parsed.pos.x) && Number.isFinite(parsed.pos.y)
+      ? { x: parsed.pos.x, y: parsed.pos.y }
+      : { x: 0, y: 0 };
+    return { tabs, activeId, mode, pos };
+  } catch {
+    return fallback;
+  }
+};
 
 function TerminalTab({ sessionKey }: { sessionKey: string }) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -215,13 +288,14 @@ function TerminalTab({ sessionKey }: { sessionKey: string }) {
   );
 }
 
-function NoteTab({ openOnMount }: { openOnMount?: boolean }) {
-  const [content, setContent] = useState('');
-  const [path, setPath] = useState<string | null>(null);
-  const [name, setName] = useState('未命名笔记');
-  const [preview, setPreview] = useState(false);
+function NoteTab({ tabId, openOnMount }: { tabId: string; openOnMount?: boolean }) {
+  const [initialSnapshot] = useState<NoteSnapshot | null>(() => readTabSnapshot<NoteSnapshot>(tabId, 'note'));
+  const [content, setContent] = useState(initialSnapshot?.content ?? '');
+  const [path, setPath] = useState<string | null>(initialSnapshot?.path ?? null);
+  const [name, setName] = useState(initialSnapshot?.name ?? '未命名笔记');
+  const [preview, setPreview] = useState(initialSnapshot?.preview ?? false);
   const [savedAt, setSavedAt] = useState<string | null>(null);
-  const openedRef = useRef(false);
+  const openedRef = useRef(initialSnapshot !== null);
 
   const html = useMemo(() => DOMPurify.sanitize(marked.parse(content) as string), [content]);
 
@@ -247,6 +321,10 @@ function NoteTab({ openOnMount }: { openOnMount?: boolean }) {
       setSavedAt(new Date().toLocaleTimeString('zh-CN', { hour12: false }));
     }
   }, [path, content]);
+
+  useEffect(() => {
+    writeTabSnapshot(tabId, 'note', { content, path, name, preview } satisfies NoteSnapshot);
+  }, [content, name, path, preview, tabId]);
 
   useEffect(() => {
     if (openOnMount && !openedRef.current) {
@@ -280,10 +358,11 @@ function NoteTab({ openOnMount }: { openOnMount?: boolean }) {
   );
 }
 
-function BrowserTab() {
+function BrowserTab({ tabId }: { tabId: string }) {
   const webviewRef = useRef<HTMLElement | null>(null);
-  const [url, setUrl] = useState('');
-  const [src, setSrc] = useState('about:blank');
+  const [initialSnapshot] = useState<BrowserSnapshot | null>(() => readTabSnapshot<BrowserSnapshot>(tabId, 'browser'));
+  const [url, setUrl] = useState(initialSnapshot?.url ?? '');
+  const [src, setSrc] = useState(initialSnapshot?.src ?? 'about:blank');
   const canWebview = useMemo(() => {
     if (typeof document === 'undefined') return false;
     try {
@@ -301,6 +380,10 @@ function BrowserTab() {
     setUrl(target);
     setSrc(target);
   }, [url]);
+
+  useEffect(() => {
+    writeTabSnapshot(tabId, 'browser', { url, src } satisfies BrowserSnapshot);
+  }, [src, tabId, url]);
 
   // Keep the address bar in sync with the embedded browser's location.
   useEffect(() => {
@@ -351,10 +434,11 @@ function BrowserTab() {
 }
 
 const FloatingWorkspace = forwardRef<FloatingWorkspaceHandle, FloatingWorkspaceProps>(function FloatingWorkspace({ open, onClose }, ref) {
-  const [tabs, setTabs] = useState<Tab[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
-  const [mode, setMode] = useState<PanelMode>('min');
-  const [pos, setPos] = useState({ x: 0, y: 0 });
+  const [initialWorkspace] = useState<WorkspaceSnapshot>(loadWorkspaceSnapshot);
+  const [tabs, setTabs] = useState<Tab[]>(() => initialWorkspace.tabs);
+  const [activeId, setActiveId] = useState<string | null>(() => initialWorkspace.activeId);
+  const [mode, setMode] = useState<PanelMode>(() => initialWorkspace.mode);
+  const [pos, setPos] = useState(() => initialWorkspace.pos);
   const [menuOpen, setMenuOpen] = useState(false);
   const [menuRect, setMenuRect] = useState<{ left: number; top: number } | null>(null);
   const addBtnRef = useRef<HTMLButtonElement>(null);
@@ -387,6 +471,8 @@ const FloatingWorkspace = forwardRef<FloatingWorkspaceHandle, FloatingWorkspaceP
     setTabs((prev) => {
       const index = prev.findIndex((t) => t.id === id);
       if (index === -1) return prev;
+      const closingTab = prev[index];
+      removeTabSnapshot(closingTab.id, closingTab.kind);
       const next = prev.filter((t) => t.id !== id);
       setActiveId((current) => {
         if (current !== id) return current;
@@ -396,6 +482,14 @@ const FloatingWorkspace = forwardRef<FloatingWorkspaceHandle, FloatingWorkspaceP
       return next;
     });
   }, []);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(WORKSPACE_STORAGE_KEY, JSON.stringify({ tabs, activeId, mode, pos } satisfies WorkspaceSnapshot));
+    } catch {
+      // Local persistence is best effort; the current in-memory session still works.
+    }
+  }, [activeId, mode, pos, tabs]);
 
   const minimize = useCallback(() => setMode((current) => (current === 'min' ? 'normal' : 'min')), []);
 
@@ -497,8 +591,8 @@ const FloatingWorkspace = forwardRef<FloatingWorkspaceHandle, FloatingWorkspaceP
             tabs.map((tab) => (
               <div key={tab.id} className={`ft-body ${tab.id === activeId ? 'active' : ''}`}>
                 {tab.kind === 'terminal' && <TerminalTab sessionKey={tab.id} />}
-                {tab.kind === 'note' && <NoteTab openOnMount={tab.openOnMount} />}
-                {tab.kind === 'browser' && <BrowserTab />}
+                {tab.kind === 'note' && <NoteTab tabId={tab.id} openOnMount={tab.openOnMount} />}
+                {tab.kind === 'browser' && <BrowserTab tabId={tab.id} />}
               </div>
             ))
           )}
