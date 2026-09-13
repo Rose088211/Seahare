@@ -280,7 +280,13 @@ function startTerminal(win, opts) {
   let args = [];
   if (isPowerShell) {
     const profilePath = path.join(__dirname, 'ps-profile.ps1');
-    args = ['-NoLogo', '-NoExit', '-Command', '. "' + profilePath + '"'];
+    // Do not dot-source the bundled .ps1 directly. On systems using
+    // AllSigned execution policy, that produces a signature error before
+    // the terminal prompt appears. Read the profile as text and evaluate it
+    // in-session without changing the user's machine-wide policy.
+    const escapedProfilePath = profilePath.replace(/'/g, "''");
+    const loadProfile = `$profileText = Get-Content -Raw -LiteralPath '${escapedProfilePath}'; Invoke-Expression $profileText`;
+    args = ['-NoLogo', '-NoExit', '-ExecutionPolicy', 'Bypass', '-Command', loadProfile];
   } else if (isBash) {
     args = ['--noprofile', '--norc', '-i'];
   }
