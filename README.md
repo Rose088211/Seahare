@@ -52,7 +52,7 @@
 
 ### 下载预构建版本
 
-从 [Releases](https://github.com/你的用户名/seahare/releases) 下载最新版本，解压后直接运行 `Seahare.exe` 即可，无需安装任何运行时环境。
+从 [Releases](https://github.com/Rose088211/seahare/releases) 下载最新版本，解压后直接运行 `Seahare.exe` 即可，无需安装任何运行时环境。
 
 ### 创建新扫描
 
