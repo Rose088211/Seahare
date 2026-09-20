@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Clock,
   Cpu,
+  Copy,
   Download,
   ExternalLink,
   FileText,
@@ -553,6 +554,7 @@ export default function App() {
   const [severityFilter, setSeverityFilter] = useState<Severity>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [expandedResultIds, setExpandedResultIds] = useState<Set<number>>(new Set());
+  const [copiedResultId, setCopiedResultId] = useState<number | null>(null);
   const [expandedHistoryHosts, setExpandedHistoryHosts] = useState<Set<string>>(new Set());
   const [expandedHistoryTargets, setExpandedHistoryTargets] = useState<Set<string>>(new Set());
   const [expandedHistoryFolders, setExpandedHistoryFolders] = useState<Set<string>>(new Set());
@@ -1713,6 +1715,29 @@ export default function App() {
     });
   };
 
+  const copyResultUrl = async (result: ScanResult) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(result.url);
+      } else {
+        const input = document.createElement('textarea');
+        input.value = result.url;
+        input.style.position = 'fixed';
+        input.style.opacity = '0';
+        document.body.appendChild(input);
+        input.select();
+        document.execCommand('copy');
+        input.remove();
+      }
+      setCopiedResultId(result.id);
+      window.setTimeout(() => {
+        setCopiedResultId((current) => current === result.id ? null : current);
+      }, 1200);
+    } catch {
+      alert('复制接口地址失败，请手动复制');
+    }
+  };
+
   const hasResultEvidence = (result: ScanResult) =>
     Boolean(result.spa_fallback || result.business_code !== null && result.business_code !== undefined
       || result.business_message || result.response_preview || result.body_hash);
@@ -1730,6 +1755,43 @@ export default function App() {
   const formatBytes = (bytes: number) => bytes < 1024 ? `${bytes} B` : `${(bytes / 1024).toFixed(1)} KB`;
   const statusCodeClass = (code: number) => code < 300 ? 'status-2xx' : code < 400 ? 'status-3xx' : code < 500 ? 'status-4xx' : 'status-5xx';
 
+  const renderResultPathCell = (result: ScanResult, expanded: boolean, hasEvidence: boolean) => (
+    <td className="cell-path" title={result.url}>
+      {hasEvidence && (
+        <button
+          type="button"
+          className={`cell-expand ${expanded ? 'active' : ''}`}
+          onClick={() => toggleResultExpanded(result.id)}
+          title={expanded ? '收起证据详情' : '展开业务错误与响应证据'}
+          aria-expanded={expanded}
+          aria-label={`展开或收起 ${result.path} 的证据详情`}
+        >
+          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+        </button>
+      )}
+      <button
+        type="button"
+        className="cell-path-copy"
+        onClick={() => { void copyResultUrl(result); }}
+        title={copiedResultId === result.id ? '已复制完整接口地址' : `复制完整接口地址：${result.url}`}
+        aria-label={copiedResultId === result.id ? `已复制 ${result.path}` : `复制接口地址 ${result.path}`}
+      >
+        <span>{result.path}</span>
+        {copiedResultId === result.id ? <Check size={10} /> : <Copy size={10} />}
+      </button>
+      <a
+        className="cell-path-open"
+        href={result.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        title="打开接口响应（JSON）"
+        aria-label={`打开接口响应 ${result.path}`}
+      >
+        <ExternalLink size={10} />
+      </a>
+    </td>
+  );
+
   const renderVirtualResult = (result: ScanResult, index: number, measureRow: VirtualRowMeasure) => {
     const expanded = expandedResultIds.has(result.id);
     const hasEvidence = hasResultEvidence(result);
@@ -1742,6 +1804,8 @@ export default function App() {
             if (node) measureRow(result.id, 'base', node.getBoundingClientRect().height);
           }}
         >
+          {renderResultPathCell(result, expanded, hasEvidence)}
+          {false && (
           <td className="cell-path" title={result.path}>
             {hasEvidence && (
               <button
@@ -1759,6 +1823,7 @@ export default function App() {
               <span>{result.path}</span><ExternalLink size={10} />
             </a>
           </td>
+          )}
           <td className="cell-method"><span className="method-badge">{result.request_method}</span></td>
           <td><span className={`status-code-badge ${statusCodeClass(result.status)}`}>{result.status}</span></td>
           <td><span className={`severity-badge severity-${result.severity || 'low'}`}>{severityText[result.severity || 'low']}</span></td>
@@ -2329,6 +2394,8 @@ export default function App() {
                             return (
                               <Fragment key={result.id}>
                                 <tr className={`result-row ${index % 2 === 1 ? 'row-striped' : ''} ${expanded ? 'row-expanded' : ''}`}>
+                                  {renderResultPathCell(result, expanded, hasEvidence)}
+                                  {false && (
                                   <td className="cell-path" title={result.path}>
                                     {hasEvidence && (
                                       <button
@@ -2346,6 +2413,7 @@ export default function App() {
                                       <span>{result.path}</span><ExternalLink size={10} />
                                     </a>
                                   </td>
+                                  )}
                                   <td className="cell-method"><span className="method-badge">{result.request_method}</span></td>
                                   <td><span className={`status-code-badge ${statusCodeClass(result.status)}`}>{result.status}</span></td>
                                   <td><span className={`severity-badge severity-${result.severity || 'low'}`}>{severityText[result.severity || 'low']}</span></td>

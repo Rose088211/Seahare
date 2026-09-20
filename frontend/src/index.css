@@ -1571,6 +1571,45 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
   color: var(--color-primary);
 }
 
+.cell-path-copy,
+.cell-path-open {
+  display: inline-flex;
+  align-items: center;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+}
+
+.cell-path-copy {
+  gap: 4px;
+  max-width: calc(100% - 20px);
+  padding: 0;
+  overflow: hidden;
+  cursor: copy;
+  text-align: left;
+}
+
+.cell-path-copy span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-path-copy:hover {
+  color: var(--color-primary);
+}
+
+.cell-path-open {
+  margin-left: 5px;
+  color: var(--text-muted);
+  cursor: pointer;
+  vertical-align: middle;
+}
+
+.cell-path-open:hover {
+  color: var(--color-primary);
+}
+
 .cell-url {
   color: var(--text-muted);
   max-width: 300px;
