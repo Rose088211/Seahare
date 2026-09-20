@@ -19,6 +19,7 @@ import {
   Globe,
   History,
   Info,
+  ListChecks,
   ListFilter,
   Loader2,
   Moon,
@@ -33,7 +34,6 @@ import {
   Route,
   RotateCcw,
   Search,
-  ListChecks,
   Sparkles,
   ShieldAlert,
   ShieldCheck,
@@ -123,6 +123,7 @@ interface Scan {
 interface HistoryTargetGroup {
   key: string;
   path: string;
+  scopeType: 'subdomain' | 'path';
   scans: Scan[];
 }
 
@@ -132,6 +133,60 @@ interface HistoryHostGroup {
   targets: HistoryTargetGroup[];
 }
 
+const scanCreatedTime = (scan: Scan) => {
+  const time = Date.parse(scan.created_at);
+  return Number.isNaN(time) ? 0 : time;
+};
+
+const compareScansByCreatedAt = (left: Scan, right: Scan) => scanCreatedTime(right) - scanCreatedTime(left);
+
+interface ParsedHistoryTarget {
+  domain: string;
+  path: string;
+  scopeType: 'subdomain' | 'path';
+}
+
+const compoundDomainSuffixes = new Set(['co.uk', 'org.uk', 'com.au', 'co.jp', 'com.cn', 'net.cn', 'org.cn', 'com.hk', 'com.tw']);
+
+const isIpOrLocalHost = (hostname: string) => hostname === 'localhost'
+  || hostname.includes(':')
+  || /^(?:\d{1,3}\.){3}\d{1,3}$/.test(hostname);
+
+const getRootHostname = (hostname: string) => {
+  if (isIpOrLocalHost(hostname)) return hostname;
+  const labels = hostname.split('.').filter(Boolean);
+  if (labels.length <= 2) return hostname;
+  const suffix = labels.slice(-2).join('.');
+  return compoundDomainSuffixes.has(suffix) ? labels.slice(-3).join('.') : suffix;
+};
+
+const normalizeHistoryPath = (pathname: string) => pathname.replace(/\/+$/, '') || '/';
+
+const parseHistoryTarget = (target: string): ParsedHistoryTarget => {
+  try {
+    const parsed = new URL(target);
+    const hostname = parsed.hostname.toLowerCase();
+    const port = parsed.port ? `:${parsed.port}` : '';
+    const host = `${hostname}${port}`;
+    const rootDomain = `${getRootHostname(hostname)}${port}`;
+    const isSubdomain = host !== rootDomain;
+    return {
+      domain: rootDomain,
+      path: isSubdomain ? host : normalizeHistoryPath(parsed.pathname),
+      scopeType: isSubdomain ? 'subdomain' : 'path',
+    };
+  } catch {
+    const normalized = target.trim().replace(/^https?:\/\//i, '').replace(/\/+$/, '');
+    const separator = normalized.indexOf('/');
+    const rawDomain = separator >= 0 ? normalized.slice(0, separator) : normalized;
+    return {
+      domain: rawDomain,
+      path: separator >= 0 ? normalizeHistoryPath(`/${normalized.slice(separator + 1).split('?')[0]}`) : '/',
+      scopeType: 'path',
+    };
+  }
+};
+
 interface HistoryFolder {
   id: string;
   name: string;
@@ -140,7 +195,12 @@ interface HistoryFolder {
   origin: 'custom' | 'auto';
 }
 
-function parseHistoryFolder(value: unknown): HistoryFolder | null {
+interface HistoryDragPayload {
+  scanIds: string[];
+  folder?: HistoryFolder;
+}
+
+const parseHistoryFolder = (value: unknown): HistoryFolder | null => {
   if (!value || typeof value !== 'object') return null;
   const item = value as Record<string, unknown>;
   if (!item.id || !item.name) return null;
@@ -154,12 +214,7 @@ function parseHistoryFolder(value: unknown): HistoryFolder | null {
     children,
     origin: item.origin === 'auto' ? 'auto' : 'custom',
   };
-}
-
-interface HistoryDragPayload {
-  scanIds: string[];
-  folder?: HistoryFolder;
-}
+};
 
 const collectHistoryFolderScanIds = (folder: HistoryFolder): string[] => [
   ...folder.scanIds,
@@ -177,10 +232,7 @@ const containsHistoryFolder = (folder: HistoryFolder, folderId: string): boolean
 
 const removeHistoryFolder = (folders: HistoryFolder[], folderId: string): { folders: HistoryFolder[]; removed: HistoryFolder | null } => {
   const index = folders.findIndex((folder) => folder.id === folderId);
-  if (index >= 0) {
-    const removed = folders[index];
-    return { folders: folders.filter((_, currentIndex) => currentIndex !== index), removed };
-  }
+  if (index >= 0) return { folders: folders.filter((_, currentIndex) => currentIndex !== index), removed: folders[index] };
   for (let index = 0; index < folders.length; index += 1) {
     const result = removeHistoryFolder(folders[index].children, folderId);
     if (result.removed) {
@@ -192,18 +244,20 @@ const removeHistoryFolder = (folders: HistoryFolder[], folderId: string): { fold
   return { folders, removed: null };
 };
 
-const appendHistoryFolderChild = (folders: HistoryFolder[], parentId: string, child: HistoryFolder): HistoryFolder[] => folders.map((folder) => {
-  if (folder.id === parentId) return { ...folder, children: [...folder.children, child] };
-  return { ...folder, children: appendHistoryFolderChild(folder.children, parentId, child) };
-});
+const appendHistoryFolderChild = (folders: HistoryFolder[], parentId: string, child: HistoryFolder): HistoryFolder[] => folders.map((folder) => (
+  folder.id === parentId
+    ? { ...folder, children: [...folder.children, child] }
+    : { ...folder, children: appendHistoryFolderChild(folder.children, parentId, child) }
+));
 
 const hasHistoryFolder = (folders: HistoryFolder[], folderId: string): boolean => folders.some((folder) => folder.id === folderId
   || hasHistoryFolder(folder.children, folderId));
 
-const appendHistoryScanToFolder = (folders: HistoryFolder[], folderId: string, scanId: string): HistoryFolder[] => folders.map((folder) => {
-  if (folder.id === folderId) return { ...folder, scanIds: [...new Set([...folder.scanIds, scanId])] };
-  return { ...folder, children: appendHistoryScanToFolder(folder.children, folderId, scanId) };
-});
+const appendHistoryScanToFolder = (folders: HistoryFolder[], folderId: string, scanId: string): HistoryFolder[] => folders.map((folder) => (
+  folder.id === folderId
+    ? { ...folder, scanIds: [...new Set([...folder.scanIds, scanId])] }
+    : { ...folder, children: appendHistoryScanToFolder(folder.children, folderId, scanId) }
+));
 
 const createAutoTargetFolder = (target: HistoryTargetGroup): HistoryFolder => ({
   id: `auto-target-${target.key}`,
@@ -564,30 +618,33 @@ export default function App() {
   const historyGroups = useMemo<HistoryHostGroup[]>(() => {
     const hostGroups = new Map<string, HistoryHostGroup>();
     scans.forEach((scan) => {
-      let origin = '';
-      let hostLabel = '';
-      let path = '/';
-      try {
-        const parsed = new URL(scan.target);
-        origin = parsed.origin;
-        hostLabel = parsed.host;
-        path = `${parsed.pathname || '/'}${parsed.search}`;
-      } catch {
-        origin = scan.target;
-        hostLabel = scan.target.replace(/^https?:\/\//, '').split('/')[0];
-        path = `/${scan.target.split('/').slice(3).join('/')}` || '/';
-      }
-
-      const hostGroup = hostGroups.get(origin) || { key: origin, label: hostLabel || origin, targets: [] };
-      let targetGroup = hostGroup.targets.find((target) => target.key === scan.target);
+      const parsedTarget = parseHistoryTarget(scan.target);
+      const hostGroup = hostGroups.get(parsedTarget.domain) || {
+        key: parsedTarget.domain,
+        label: parsedTarget.domain,
+        targets: [],
+      };
+      let targetGroup = hostGroup.targets.find((target) => target.key === `${parsedTarget.domain}${parsedTarget.path}`);
       if (!targetGroup) {
-        targetGroup = { key: scan.target, path, scans: [] };
+        targetGroup = {
+          key: `${parsedTarget.domain}${parsedTarget.path}`,
+          path: parsedTarget.path,
+          scopeType: parsedTarget.scopeType,
+          scans: [],
+        };
         hostGroup.targets.push(targetGroup);
       }
       targetGroup.scans.push(scan);
-      hostGroups.set(origin, hostGroup);
+      hostGroups.set(parsedTarget.domain, hostGroup);
     });
-    return [...hostGroups.values()];
+    return [...hostGroups.values()]
+      .map((group) => ({
+        ...group,
+        targets: [...group.targets]
+          .map((target) => ({ ...target, scans: [...target.scans].sort(compareScansByCreatedAt) }))
+          .sort((left, right) => compareScansByCreatedAt(left.scans[0], right.scans[0])),
+      }))
+      .sort((left, right) => compareScansByCreatedAt(left.targets[0].scans[0], right.targets[0].scans[0]));
   }, [scans]);
 
   const filteredHistoryGroups = useMemo(
@@ -826,7 +883,8 @@ export default function App() {
   };
 
   const inheritHistoryFolderForScan = (scan: Scan) => {
-    const targetFolderId = `auto-target-${scan.target}`;
+    const parsedTarget = parseHistoryTarget(scan.target);
+    const targetFolderId = `auto-target-${parsedTarget.domain}${parsedTarget.path}`;
     setHistoryFolders((current) => hasHistoryFolder(current, targetFolderId)
       ? appendHistoryScanToFolder(current, targetFolderId, scan.id)
       : current);
@@ -1350,11 +1408,6 @@ export default function App() {
   const historyScanDisplayName = (scan: Scan) => historyScanNames[scan.id]
     || `${targetTypeText[scan.target_type] || scan.target_type}扫描`;
 
-  const startHistoryScanRename = (scan: Scan) => {
-    setEditingHistoryScanId(scan.id);
-    setHistoryScanEditName(historyScanDisplayName(scan));
-  };
-
   const cancelHistoryScanRename = () => {
     setEditingHistoryScanId(null);
     setHistoryScanEditName('');
@@ -1366,28 +1419,6 @@ export default function App() {
     if (!name) return;
     setHistoryScanNames((current) => ({ ...current, [scanId]: name }));
     cancelHistoryScanRename();
-  };
-
-  const deleteHistoryScan = async (scan: Scan) => {
-    if (!window.confirm(`删除扫描任务“${historyScanDisplayName(scan)}”？扫描结果也会被删除。`)) return;
-    try {
-      const response = await fetch(`${API_BASE}/api/scans/${scan.id}`, { method: 'DELETE' });
-      if (!response.ok) throw new Error((await response.json()).error || '删除扫描任务失败');
-      setScans((current) => current.filter((item) => item.id !== scan.id));
-      setHistoryFolders((current) => removeHistoryScanIds(current, new Set([scan.id])));
-      setHistoryScanNames((current) => {
-        const next = { ...current };
-        delete next[scan.id];
-        return next;
-      });
-      if (selectedScanId === scan.id) {
-        setSelectedScanId(null);
-        setCurrentScan(null);
-        setViewMode('detail');
-      }
-    } catch (error) {
-      alert(error instanceof Error ? error.message : '删除扫描任务失败');
-    }
   };
 
   const historyHostDisplayName = (group: HistoryHostGroup) => historyHostNames[group.key] || group.label;
@@ -1818,15 +1849,10 @@ export default function App() {
           <span className="history-item-target" title={`${historyScanDisplayName(scan)} ${scan.target}`}>
             {historyScanDisplayName(scan)}
           </span>
-          <span className={`history-item-badge badge-${scan.status}`}>{getStatusText(scan.status)}</span>
+          <span className="history-item-meta"><span>{formatTime(scan.created_at)}</span></span>
         </span>
-        <span className="history-item-meta"><span>发现 {scan.found}</span><span>{formatTime(scan.created_at)}</span></span>
       </span>
       </button>
-      <div className="history-scan-actions">
-        <button type="button" className="history-scan-action" title={`重命名扫描任务 ${historyScanDisplayName(scan)}`} aria-label={`重命名扫描任务 ${historyScanDisplayName(scan)}`} onClick={() => startHistoryScanRename(scan)}><Pencil size={12} /></button>
-        <button type="button" className="history-scan-action danger" title={`删除扫描任务 ${historyScanDisplayName(scan)}`} aria-label={`删除扫描任务 ${historyScanDisplayName(scan)}`} onClick={() => deleteHistoryScan(scan)}><Trash2 size={12} /></button>
-      </div>
         </>
       )}
     </div>
@@ -2173,7 +2199,7 @@ export default function App() {
                           </div>
                           {hostExpanded && (
                             <div className="history-tree-children" role="group">
-                              {hostGroup.targets.map((targetGroup) => {
+                              {hostGroup.targets.filter((targetGroup) => targetGroup.path !== '/').map((targetGroup) => {
                                 const targetExpanded = expandedHistoryTargets.has(targetGroup.key);
                                 const targetLabel = targetGroup.path === '/' ? '根路径' : targetGroup.path;
                                 return (
@@ -2195,7 +2221,11 @@ export default function App() {
                                       title={targetGroup.key}
                                     >
                                       {targetExpanded ? <ChevronDown className="history-tree-chevron" size={11} /> : <ChevronRight className="history-tree-chevron" size={11} />}
-                                      <Route className="history-node-icon history-target-icon" size={13} aria-label="目标路径" />
+                                      {targetGroup.scopeType === 'subdomain' ? (
+                                        <Globe className="history-node-icon history-target-icon" size={13} aria-label="子域名" />
+                                      ) : (
+                                        <Route className="history-node-icon history-target-icon" size={13} aria-label="目标路径" />
+                                      )}
                                       <span className="history-target-path">{targetLabel}</span>
                                       <span className="history-group-count">{targetGroup.scans.length}</span>
                                     </button>
@@ -2207,6 +2237,10 @@ export default function App() {
                                   </div>
                                 );
                               })}
+                              {hostGroup.targets
+                                .filter((targetGroup) => targetGroup.path === '/')
+                                .flatMap((targetGroup) => targetGroup.scans)
+                                .map(renderHistoryScan)}
                             </div>
                           )}
                         </div>

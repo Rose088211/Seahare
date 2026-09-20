@@ -955,7 +955,8 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
 
 .history-item-target {
   font-weight: 600;
-  font-size: 12px;
+  font-size: 11px;
+  line-height: 15px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -984,7 +985,9 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
 .history-item-meta {
   display: flex;
   justify-content: space-between;
-  font-size: 10px;
+  flex: 0 0 auto;
+  font-size: 9px;
+  line-height: 15px;
   color: var(--text-muted);
 }
 
@@ -1106,17 +1109,17 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
 }
 
 .history-tree-leaves {
-  padding: 1px 0 3px 8px;
+  padding: 1px 0 2px 8px;
 }
 
 .history-scan-item {
   display: flex;
   flex-direction: row;
-  align-items: flex-start;
-  gap: 7px;
-  min-height: 42px;
-  padding: 6px 7px 6px 9px;
-  margin-bottom: 2px;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  padding: 3px 7px 3px 9px;
+  margin-bottom: 1px;
   border-radius: var(--radius-sm);
 }
 
@@ -1207,7 +1210,6 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
 
 .history-leaf-icon {
   flex: 0 0 auto;
-  margin-top: 2px;
   color: var(--text-muted);
 }
 
@@ -1216,7 +1218,7 @@ html:is(.glass-theme, .mist-theme) .theme-picker-menu {
   flex: 1;
   min-width: 0;
   flex-direction: column;
-  gap: 3px;
+  gap: 0;
 }
 
 /* Middle Pane: Results Main View */
