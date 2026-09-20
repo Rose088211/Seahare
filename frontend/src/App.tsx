@@ -11,6 +11,7 @@ import {
   Cpu,
   Copy,
   Download,
+  Eye,
   ExternalLink,
   FileText,
   Folder,
@@ -501,6 +502,202 @@ const createDefaultScanName = (target: string, existingScans: Scan[]) => {
   return `${targetLabel}-${timestamp}-scan-${attempt}`;
 };
 
+interface HostMapPathNode {
+  label: string;
+  path: string;
+  children: HostMapPathNode[];
+}
+
+interface HostMapPort {
+  key: string;
+  label: string;
+  scanCount: number;
+  paths: HostMapPathNode[];
+}
+
+interface HostMapSnapshot {
+  host: string;
+  ports: HostMapPort[];
+}
+
+interface HostMapResultPage {
+  results?: Array<{ path?: string; url?: string }>;
+  next_cursor?: number;
+  has_more?: boolean;
+}
+
+const hostMapIdentity = (target: string) => {
+  try {
+    return new URL(target).hostname.toLowerCase();
+  } catch {
+    return target.replace(/^https?:\/\//i, '').split(/[/:]/, 1)[0].toLowerCase();
+  }
+};
+
+const hostMapPort = (target: string) => {
+  try {
+    const parsed = new URL(target);
+    return parsed.port || (parsed.protocol === 'https:' ? '443' : '80');
+  } catch {
+    return 'unknown';
+  }
+};
+
+const hostMapPath = (target: string) => {
+  try {
+    return new URL(target).pathname.replace(/\/+$/, '') || '/';
+  } catch {
+    const withoutQuery = target.split(/[?#]/, 1)[0];
+    const slash = withoutQuery.indexOf('/', withoutQuery.indexOf('//') + 2);
+    return slash >= 0 ? `/${withoutQuery.slice(slash + 1).replace(/\/+$/, '')}` : '/';
+  }
+};
+
+const insertHostMapPath = (roots: HostMapPathNode[], rawPath: string) => {
+  const path = rawPath.startsWith('/') ? rawPath : `/${rawPath}`;
+  const segments = path === '/' ? ['/'] : path.split('/').filter(Boolean);
+  let current = roots;
+  let accumulated = '';
+  segments.forEach((segment) => {
+    accumulated = accumulated ? `${accumulated}/${segment}` : `/${segment}`;
+    let node = current.find((item) => item.label === segment);
+    if (!node) {
+      node = { label: segment, path: accumulated, children: [] };
+      current.push(node);
+    }
+    current = node.children;
+  });
+};
+
+function HostMapModal({
+  hostGroup,
+  scans,
+  onClose,
+}: {
+  hostGroup: HistoryHostGroup;
+  scans: Scan[];
+  onClose: () => void;
+}) {
+  const [snapshot, setSnapshot] = useState<HostMapSnapshot | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const host = hostMapIdentity(hostGroup.label);
+
+  const relatedScans = useMemo(
+    () => scans.filter((scan) => hostMapIdentity(scan.target) === host),
+    [host, scans],
+  );
+  const relatedScansRef = useRef(relatedScans);
+  relatedScansRef.current = relatedScans;
+  const relatedScanKey = useMemo(
+    () => relatedScans
+      .map((scan) => `${scan.id}:${scan.target}:${scan.status}:${scan.found}`)
+      .sort()
+      .join('|'),
+    [relatedScans],
+  );
+  const hasLoadedSnapshotRef = useRef(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    const loadMap = async () => {
+      // Keep the current map visible while polling refreshes its data.
+      setLoading(!hasLoadedSnapshotRef.current);
+      setError(null);
+      try {
+        const currentRelatedScans = relatedScansRef.current;
+        const portMap = new Map<string, { label: string; scanIds: Set<string>; paths: Set<string> }>();
+        currentRelatedScans.forEach((scan) => {
+          const port = hostMapPort(scan.target);
+          const item = portMap.get(port) || { label: `端口 ${port}`, scanIds: new Set<string>(), paths: new Set<string>() };
+          item.scanIds.add(scan.id);
+          item.paths.add(hostMapPath(scan.target));
+          portMap.set(port, item);
+        });
+
+        const pages = await Promise.all(currentRelatedScans.map(async (scan) => {
+          const results: Array<{ path?: string; url?: string }> = [];
+          let cursor = 0;
+          for (let page = 0; page < 50; page += 1) {
+            const response = await fetch(`${API_BASE}/api/scans/${encodeURIComponent(scan.id)}/results?after_id=${cursor}&limit=500`);
+            if (!response.ok) break;
+            const payload = await response.json() as HostMapResultPage;
+            results.push(...(payload.results || []));
+            const nextCursor = Number(payload.next_cursor || cursor);
+            if (!payload.has_more || nextCursor <= cursor) break;
+            cursor = nextCursor;
+          }
+          return results;
+        }));
+
+        pages.flat().forEach((result) => {
+          const port = hostMapPort(result.url || '');
+          const item = portMap.get(port);
+          if (item && result.path) item.paths.add(result.path);
+        });
+
+        const ports = [...portMap.entries()]
+          .sort(([left], [right]) => Number(left) - Number(right))
+          .map(([key, item]) => {
+            const paths: HostMapPathNode[] = [];
+            [...item.paths].sort().forEach((path) => insertHostMapPath(paths, path));
+            return { key, label: item.label, scanCount: item.scanIds.size, paths };
+          });
+        if (!cancelled) {
+          setSnapshot({ host, ports });
+          hasLoadedSnapshotRef.current = true;
+        }
+      } catch (loadError) {
+        if (!cancelled) setError(loadError instanceof Error ? loadError.message : '网站测绘数据加载失败');
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    };
+    void loadMap();
+    return () => { cancelled = true; };
+  }, [host, relatedScanKey]);
+
+  const renderPathNodes = (nodes: HostMapPathNode[], depth = 0): React.ReactNode => nodes.map((node) => (
+    <div className="host-map-path-node" style={{ '--tree-depth': depth } as React.CSSProperties} key={node.path}>
+      <span className="host-map-path-dot" />
+      <span className="host-map-path-label" title={node.path}>{node.label === '/' ? '/' : `/${node.label}`}</span>
+      {node.children.length > 0 && <div className="host-map-path-children">{renderPathNodes(node.children, depth + 1)}</div>}
+    </div>
+  ));
+
+  return (
+    <div className="host-map-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}>
+      <section className="host-map-dialog" role="dialog" aria-modal="true" aria-labelledby="host-map-title">
+        <header className="host-map-header">
+          <div className="host-map-title-wrap"><Eye size={16} /><div><strong id="host-map-title">网站测绘地图</strong><span>{host}</span></div></div>
+          <button type="button" className="host-map-close" onClick={onClose} aria-label="关闭网站测绘地图"><X size={16} /></button>
+        </header>
+        {loading && !snapshot ? (
+          <div className="host-map-state"><Loader2 size={24} className="spinning" /><span>正在整理端口与访问路径…</span></div>
+        ) : error && !snapshot ? (
+          <div className="host-map-state error"><AlertCircle size={22} /><span>{error}</span></div>
+        ) : snapshot && snapshot.ports.length > 0 ? (
+          <div className="host-map-canvas">
+            <div className="host-map-planet"><Globe size={25} /><strong>{snapshot.host}</strong><span>主机</span></div>
+            <div className="host-map-trunk" />
+            <div className="host-map-ports">
+              {snapshot.ports.map((port) => (
+                <article className="host-map-port" key={port.key}>
+                  <div className="host-map-port-node"><span className="host-map-port-orb" /><strong>{port.label}</strong><small>{port.scanCount} 个扫描任务</small></div>
+                  <div className="host-map-port-line" />
+                  <div className="host-map-path-tree">{renderPathNodes(port.paths)}</div>
+                </article>
+              ))}
+            </div>
+          </div>
+        ) : (
+          <div className="host-map-state"><Info size={22} /><span>暂时没有可展示的端口或访问路径</span></div>
+        )}
+      </section>
+    </div>
+  );
+}
+
 export default function App() {
   const [backendOnline, setBackendOnline] = useState(false);
   const [presets, setPresets] = useState<Preset[]>([]);
@@ -557,6 +754,7 @@ export default function App() {
   const [copiedResultId, setCopiedResultId] = useState<number | null>(null);
   const [expandedHistoryHosts, setExpandedHistoryHosts] = useState<Set<string>>(new Set());
   const [expandedHistoryTargets, setExpandedHistoryTargets] = useState<Set<string>>(new Set());
+  const [hostMapGroup, setHostMapGroup] = useState<HistoryHostGroup | null>(null);
   const [expandedHistoryFolders, setExpandedHistoryFolders] = useState<Set<string>>(new Set());
   const [dragOverHistoryFolderId, setDragOverHistoryFolderId] = useState<string | null>(null);
   const [dragOverHistoryAutoKey, setDragOverHistoryAutoKey] = useState<string | null>(null);
@@ -1706,6 +1904,7 @@ export default function App() {
   });
   const showLegacyResultsTable = typeof window !== 'undefined'
     && new URLSearchParams(window.location.search).has('legacy-results-table');
+  const renderDeprecatedPathCell = () => false;
 
   const toggleResultExpanded = (id: number) => {
     setExpandedResultIds((current) => {
@@ -1805,7 +2004,7 @@ export default function App() {
           }}
         >
           {renderResultPathCell(result, expanded, hasEvidence)}
-          {false && (
+          {renderDeprecatedPathCell() && (
           <td className="cell-path" title={result.path}>
             {hasEvidence && (
               <button
@@ -2256,6 +2455,18 @@ export default function App() {
                                   <span className="history-group-count">{hostTaskCount}</span>
                                 </button>
                                 <div className="history-folder-actions">
+                                  <button
+                                    type="button"
+                                    className="history-folder-action history-map-action"
+                                    title={`打开主机测绘地图 ${historyHostDisplayName(hostGroup)}`}
+                                    aria-label={`打开主机测绘地图 ${historyHostDisplayName(hostGroup)}`}
+                                    onClick={(event) => {
+                                      event.stopPropagation();
+                                      setHostMapGroup(hostGroup);
+                                    }}
+                                  >
+                                    <Eye size={12} />
+                                  </button>
                                   <button type="button" className="history-folder-action" title={`重命名主机分组 ${historyHostDisplayName(hostGroup)}`} aria-label={`重命名主机分组 ${historyHostDisplayName(hostGroup)}`} onClick={() => startHistoryHostRename(hostGroup)}><Pencil size={12} /></button>
                                   <button type="button" className="history-folder-action danger" title={`删除主机分组 ${historyHostDisplayName(hostGroup)}`} aria-label={`删除主机分组 ${historyHostDisplayName(hostGroup)}`} onClick={() => deleteHistoryHostGroup(hostGroup)}><Trash2 size={12} /></button>
                                 </div>
@@ -2395,7 +2606,7 @@ export default function App() {
                               <Fragment key={result.id}>
                                 <tr className={`result-row ${index % 2 === 1 ? 'row-striped' : ''} ${expanded ? 'row-expanded' : ''}`}>
                                   {renderResultPathCell(result, expanded, hasEvidence)}
-                                  {false && (
+                                  {renderDeprecatedPathCell() && (
                                   <td className="cell-path" title={result.path}>
                                     {hasEvidence && (
                                       <button
@@ -2855,6 +3066,14 @@ export default function App() {
           </section>
         </div>,
         document.body,
+      )}
+
+      {hostMapGroup && (
+        <HostMapModal
+          hostGroup={hostMapGroup}
+          scans={scans}
+          onClose={() => setHostMapGroup(null)}
+        />
       )}
 
       <FloatingWorkspace ref={workspaceRef} open={workspaceOpen} onClose={() => setWorkspaceOpen(false)} />
